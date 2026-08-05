@@ -33,6 +33,10 @@
 
 1. `daily_loss_r > 0` couples future entries to prior outcomes; PropSim's `entries()` is precomputed and cannot know closures. Default is 0 (off); the V1 mirror gate runs with it off. Same class as LatigoBreak delta 3.
 2. Second attempt per leg: NT8 knows when attempt 1's position closed; PropSim generates candidates without knowing. Expected to be rare (attempt 1's stop sits at the pullback extreme; a second trigger usually forms after it would have resolved). The mirror gate MEASURES this instead of assuming.
+3. `_resolve_exit` models only the original stop, the target, and the session flatten. It deliberately omits three engine exits — breakeven stop, the 240-min position horizon, the tape-gap exit — all of which exit EARLIER, the safe direction for the busy-gate. Revisit before anyone enables `breakeven_at_r` (a breakeven exit would mislabel as "unresolved/stop", corrupting attempt-2 grants and `busy`).
+4. Intra-bar exits: ~6.5% of fills (4/61 measured) have the freeing exit print landing inside the trigger bar itself. PropSim answers by print order; NT8's `Position.MarketPosition` may lag `OnExecutionUpdate` at that bar close. These rows are the EXPECTED divergence candidates — Task 7's gate classifies them separately instead of failing the pattern on them.
+5. `busy`/TTL anchors on the trigger bar's last-TICK timestamp, not the nominal bar boundary — cross-leg suppression inherits tick jitter. Accepted with the wall-clock TTL delta; Task 7 should not chase 1-bar edge disagreements here.
+6. The corpus carries no absolute fill timestamp (`entry_tick` is slice-relative). Task 7 joins on `trig_ts` (absolute) and must re-derive fills from an IDENTICAL tape slice — always pass an explicit `--contract` to `dump_episodes.py` (its `ALL` default spans rolls and is NOT what a Replay session compares against).
 
 ---
 
