@@ -125,18 +125,19 @@ Test first (append to selfcheck): a 2-session fixture where the true range at th
 def _selfcheck_atr_pivots():
     n = 20
     h = np.full(n, 101.0); l = np.full(n, 100.0); c = np.full(n, 100.5)
-    day = np.concatenate([np.zeros(10, int), np.ones(10, int)])
-    # session 2 trades 10 points lower, internally consistent: the ONLY large
-    # move is the cross-session gap, which must NOT leak into any TR.
+    # session 2 trades 10 points lower, internally consistent. HOUSE RULE
+    # (PropSim engine._atr_wilder, validated cent-exact against NT8 in the
+    # LatigoBreak mirror): TrueRange REACHES ACROSS the session break, exactly
+    # like NinjaTrader's TrueRange; running-mean seed for i < n, Wilder
+    # recursion after; tr[0] = h-l. No `day` argument.
     h[10:] = 91.0; l[10:] = 90.0; c[10:] = 90.5
-    atr = wilder_atr(h, l, c, 5, day)
+    atr = wilder_atr(h, l, c, 5)
     assert abs(atr[9] - 1.0) < 1e-9                     # steady 1-pt bars
-    assert abs(atr[16] - 1.0) < 1e-9                    # reset: no gap contamination
-    # guard against drop-the-bar implementations: an INTRA-session jump must
-    # register. Bar 13's TR = max(5, |95-90.5|, |90-90.5|) = 5.0.
+    assert atr[10] > 2.0                                # the gap DOES hit TR once
+    assert 1.0 < atr[16] < atr[10]                      # ...and decays afterwards
+    # an intra-session jump must register and outlive the decay
     h2 = h.copy(); h2[13] = 95.0
-    atr2 = wilder_atr(h2, l, c, 5, day)
-    assert atr2[16] > 1.5
+    assert wilder_atr(h2, l, c, 5)[16] > atr[16]
     hh = np.array([1, 2, 5, 2, 1, 5, 5, 1, 2.0])
     ll = hh - 1
     hi, lo = pivots(hh, ll, 2)
@@ -144,7 +145,7 @@ def _selfcheck_atr_pivots():
     print("atr/pivots OK")
 ```
 
-Implementation — the ATR RULE, identical on both mirror sides (Task 5 ports it verbatim): sessions split by `day` (`np.flatnonzero(np.diff(day)) + 1`); no bar is dropped; the FIRST bar of a session has TR = h − l (no previous-close reference); every later bar uses TR = max(h−l, |h−pc|, |l−pc|) with pc = previous close of the SAME session; Wilder seed per session = simple mean of that session's first `n` TRs, NaN before the seed, Wilder smoothing after. `pivots` = for each `j` in `k..len-k-1`: strict unique max/min of the `2k+1` window (reuse the exact window logic from the feasibility study's `study.py` in workspace `tmp/pbstudy/`, which passed its no-lookahead selfcheck).
+Implementation — the ATR RULE, identical on both mirror sides (Task 5 ports it verbatim), copied from PropSim `engine._atr_wilder` (the recursion NT8 extends, `LatigoBreakStrategy.cs:1009-1021`, validated cent-exact in the LatigoBreak mirror): `tr[0] = h[0]-l[0]`; every other bar `tr[i] = max(h-l, |h-pc|, |l-pc|)` with `pc = c[i-1]` — TrueRange reaches ACROSS session breaks, exactly like NinjaTrader's; running-mean seed while `i < n` (`run = (run*i + tr[i])/(i+1)`), Wilder recursion `run += (tr[i]-run)/n` after; defined from bar 0, no NaN warmup. Signature: `wilder_atr(h, l, c, n)` — no `day` argument. Rationale: PullbackZone's ATR15 window spans the session boundary every morning, so the convention matters here (unlike LatigoBreak), and one rule both platforms already reproduce beats a custom reset implemented twice. `pivots` = for each `j` in `k..len-k-1`: strict unique max/min of the `2k+1` window (reuse the exact window logic from the feasibility study's `study.py` in workspace `tmp/pbstudy/`, which passed its no-lookahead selfcheck).
 
 - [ ] **Step 4: Run selfcheck — atr/pivots pass**
 
@@ -442,7 +443,7 @@ public class PullbackZoneStrategy : Strategy
 }
 ```
 
-Port `UpdateZones`/`UpdateLeg` and the three candle predicates from `propsim/pullback_zone.py` line by line — same names, same proportions, same session-reset Wilder ATR (compute both ATR15 and ATR30 manually; `nt8c` cannot resolve the system `ATR()` indicator — known gotcha, same workaround as LatigoBreak/Apertura4HMSS). ATR RULE, verbatim from Task 1: no bar dropped; first bar of a session TR = High − Low (no prev-close reference); later bars TR = max(H−L, |H−pc|, |L−pc|) with pc = previous close of the SAME session; Wilder seed = simple mean of the session's first N TRs. The zones' 15m ATR period is the internal constant `_ZONE_ATR_N15 = 14` — mirror it explicitly.
+Port `UpdateZones`/`UpdateLeg` and the three candle predicates from `propsim/pullback_zone.py` line by line — same names, same proportions, same session-reset Wilder ATR (compute both ATR15 and ATR30 manually; `nt8c` cannot resolve the system `ATR()` indicator — known gotcha, same workaround as LatigoBreak/Apertura4HMSS). ATR RULE, verbatim from Task 1 (= NT8's own TrueRange recursion, `LatigoBreakStrategy.cs:1009-1021`): `tr[0] = H-L`; later bars `max(H-L, |H-pc|, |L-pc|)` with pc = previous close, ACROSS session breaks; running-mean seed while fewer than N bars exist, then `atr += (tr - atr)/N`. The zones' 15m ATR period is the internal constant `_ZONE_ATR_N15 = 14` — mirror it explicitly. The chart/session template must be the RTH-style template so the 15m bars equal PropSim's RTH slice (pin this in the README's setup section).
 
 - [ ] **Step 2: Compile**
 
