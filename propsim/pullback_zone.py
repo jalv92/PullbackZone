@@ -61,20 +61,21 @@ PARAMS_DEFAULT = dict(
     # margin: only 0.4% of 30s bars have a range this big on their own.
     impulse_min_atr30=2.70,
     # p30 of the retracement depth of those same continuation pullbacks
-    # (raw 1.139, CI [1.10, 1.19], n=1633). This floor alone let 66% of hunts arm
-    # on ONE bar's wick; the amendment of the same date (>=2 closed bars, see
-    # `episodes`) is what fixed that, not this number, which the amendment
-    # leaves untouched -- it gates the hunt, not the retracement distribution.
+    # (raw 1.139, CI [1.10, 1.19], n=1633). Amendments 1 and 2 leave this number
+    # untouched -- they gate WHEN the hunt may arm, not the retracement
+    # distribution it is measured from. Note it does NOT exclude one-bar
+    # delivery, and under amendment 2 that is deliberate ("1 mecha vale");
+    # docs/validation.md keeps the single-bar-noise suspicion live for V2.
     pullback_min_atr30=1.15,
     use_engulfing=1, use_hammer=1, use_doji_star=1,
     entry_offset_ticks=2, entry_ttl_bars=6,
     # p80 of the adverse pierce past the trigger-time pullback extreme among
-    # pullbacks that did continue. RE-FROZEN 2026-08-05 under the >=2-bar
-    # amendment, which moves the trigger later and so changes the pierce
-    # population: 1.30 -> 1.25 (raw 1.234, CI [0.92, 1.58], n=370; recent-window
-    # 1.30, ratio 1.04). One pre-registered pass, gate PASS. 2.5x the
+    # pullbacks that did continue. RE-FROZEN under AMENDMENT 2 (the fast-
+    # pullback window), which changes which pullbacks reach a trigger at all:
+    # 1.25 -> 1.30 (raw 1.307, CI [0.95, 1.66], n=310; recent-window 1.20,
+    # ratio 1.08). One pre-registered pass per amendment, gate PASS. 2.6x the
     # provisional -- Javier's "real NQ volatility, not token ticks", measured.
-    stop_buffer_atr30=1.25,
+    stop_buffer_atr30=1.30,
     target_r=1.5, breakeven_at_r=0.0, be_offset_ticks=4,
     contracts=1, daily_loss_r=0.0, flatten_hhmm=1558,
 )
@@ -484,14 +485,18 @@ def episodes(tape, p):
         if not leg["impulse"]:
             leg["impulse"] = (d * (leg["ext"] - leg["arm_px"])
                               >= p["impulse_min_atr30"] * a30)
-        # SPEC AMENDMENT 2026-08-05 (Javier-approved, pre-registered before any
-        # P&L was observed): the counter-move must SPAN >= 2 closed bars, so the
-        # hunt arms no earlier than the close of the SECOND bar after the one
-        # that set the leg extreme. Under the original rule 66% of armed hunts
-        # armed on a single bar's wick -- the feasibility study's single-bar
-        # trap. Structural, no new dial; a new extreme resets the count exactly
-        # as it already resets the pullback (`ext_i` moves with `ext`).
-        if leg["impulse"] and not leg["hunt"] and i - leg["ext_i"] >= 2:
+        # SPEC AMENDMENT 2 -- THE FAST-PULLBACK WINDOW (Javier-approved
+        # 2026-08-05, supersedes amendment 1; pre-registered before any P&L was
+        # observed). The hunt arms at EXACTLY one bar: the close of ext_i + 2,
+        # on the pullback extreme known through that bar. Both consequences are
+        # intended -- a single bar's wick MAY deliver the whole depth ("1 mecha
+        # vale"), and depth arriving at ext_i + 3 or later never arms for that
+        # extreme ("tope 2 barras"), which is what excludes slow grinds.
+        # `==`, not `>=`: amendment 1's `>=` only delayed arming, so it was a
+        # latency rule that still let 67.6% of hunts be delivered by one bar.
+        # Structural, no new dial; a new extreme resets the window exactly as
+        # it already resets the pullback (`ext_i` moves with `ext`).
+        if leg["impulse"] and not leg["hunt"] and i == leg["ext_i"] + 2:
             leg["hunt"] = (d * (leg["ext"] - leg["pull"])
                            >= p["pullback_min_atr30"] * a30)
         if not leg["hunt"] or i <= leg["block"]:
@@ -644,7 +649,7 @@ class PullbackZone(Strategy):
                                               "candle's extreme, ticks", fixed=True),
         "entry_ttl_bars": Param(6, 1, 40, "working life of the entry, 30s bars",
                                 fixed=True),
-        "stop_buffer_atr30": Param(1.25, 0.05, 3.0, "stop beyond the pullback "
+        "stop_buffer_atr30": Param(1.30, 0.05, 3.0, "stop beyond the pullback "
                                                     "extreme, ATR30s", fixed=True),
         "target_r": Param(1.5, 0.5, 6.0, "target as a multiple of risk"),
         "breakeven_at_r": Param(0.0, 0.0, 5.0, "move the stop to entry at this "
@@ -760,10 +765,12 @@ def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False, after="continue",
     Blocks 0..16 are exactly 30 bars each, so a block index IS a 15m bar
     index; after the zone is born the layout stops caring.
 
-    `pullback` swaps the retracement for the >=2-bar amendment's paired
-    fixtures: "onebar" puts the whole counter-move in the FIRST bar after the
-    leg extreme, "twobar" is the identical star one bar later. They differ by
-    one inserted bar and nothing else, so the pair isolates the bar-count rule.
+    `pullback` swaps the retracement for amendment 2's fixtures, which bracket
+    the arming window on both sides with the SAME shooting star: "wick_at_1"
+    prints it one bar after the leg extreme (too early), "wick_at_2" at
+    ext_i + 2 (in the window -> arms and fills), "slow" grinds the depth in so
+    it only clears the floor at ext_i + 3 (too late). Consecutive variants
+    differ by one bar and nothing else, so each pair isolates the window.
 
     `after` picks what happens once attempt 1 has filled: "continue" runs the
     trade down and offers no second setup, "stopout" walks price back through
@@ -848,6 +855,14 @@ def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False, after="continue",
         one(110.0, 110.0, 104.0, 104.0)     # 15
         flat(18, 104.0, w=0.25)
         flat(30, 104.0, w=0.25)             # 16    stands in for the impulse
+        # Amendment 2 arms at exactly ext_i + 2, and the marking-time flats
+        # above put the running extreme ~48 bars before the pullback -- the
+        # window would be long shut. Re-open it: a fresh extreme here, one
+        # filler, and `rise`'s first bar lands in the window carrying enough
+        # depth. Geometry only; the impulse gate under test is untouched
+        # (extension 0.5 vs a floor of ~1.35 still refuses it).
+        one(104.0, 104.0, 103.5, 103.75)    # fresh extreme -> window opens
+        one(103.75, 104.0, 103.75, 104.0)   # ext + 1
     else:
         ramp(19, 110.0, 104.0)              # 15    departs -> leg arms
         # Wickless: a wick on a descending bar reaches back above the running
@@ -857,12 +872,23 @@ def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False, after="continue",
         # bar), so the fixture must keep dodging it to isolate what it tests.
         ramp(30, 104.0, leg_low, w=0.0)     # 16    impulse
     if pullback != "normal":
-        # One shooting star deep enough to clear pullback_min on its own (the
-        # bar's own high IS the counter extreme, so no other bar contributes).
-        # "twobar" first inserts a plain bullish bar -- no candle predicate can
-        # claim it, and its low ties the extreme rather than beating it, so the
-        # extreme (and the bar count) does not reset.
-        if pullback == "twobar":
+        # Every filler bar below LOWS AT leg_low: a tie is not a new extreme
+        # (the test is strict), so the window's anchor never moves under them.
+        if pullback == "slow":
+            # Depth crawls in at 0.25/bar -- under the floor (~0.60 at the
+            # fixture's ATR30) through ext+2, over it only at ext+3, where the
+            # same star prints. Amendment 2 must refuse it; amendment 1's `>=`
+            # would have taken it.
+            one(leg_low, leg_low + 0.25, leg_low, leg_low + 0.25)
+            one(leg_low, leg_low + 0.25, leg_low, leg_low + 0.25)
+            one(leg_low + 0.25, leg_low + 2.5, leg_low + 0.25, leg_low + 0.5)
+            one(leg_low, leg_low, leg_low - 1.5, leg_low - 1.25)
+            flat(60, leg_low - 1.25, w=0.25)
+            return b
+        # One shooting star deep enough to clear the floor on its own (its own
+        # high IS the counter extreme, so no other bar contributes). "wick_at_2"
+        # first inserts a plain bullish bar -- no candle predicate can claim it.
+        if pullback == "wick_at_2":
             one(leg_low, leg_low + 0.5, leg_low, leg_low + 0.4)
         one(leg_low + 0.25, leg_low + 4.0, leg_low, leg_low + 0.25)
         # Prints through the entry stop (star low - entry_offset_ticks).
@@ -1002,26 +1028,29 @@ def _selfcheck_episodes_negative():
     print("episodes (negative) OK")
 
 
-def _selfcheck_two_bar_pullback():
-    """Spec amendment 2026-08-05: the hunt arms no earlier than the close of
-    the SECOND bar after the leg extreme.
+def _selfcheck_fast_pullback_window():
+    """Amendment 2: the hunt arms at EXACTLY ext_i + 2 -- both edges of that
+    window are tested, and both bite.
 
-    A paired fixture, the house pattern: both tapes carry the SAME shooting
-    star over the same extreme and differ by one inserted plain bar, so what
-    is being tested is the bar count and nothing else. Verified to bite -- with
-    the `i - ext_i >= 2` clause removed, "onebar" fills instead of producing
-    nothing.
+    The house pattern, run twice: the tape that fires ("wick_at_2") and the two
+    that must not differ from it by one bar in either direction, so what is
+    under test is the window and nothing else.
+      - too early  ("wick_at_1"): the same star at ext_i + 1.
+      - too late   ("slow"):      depth only clears the floor at ext_i + 3.
+    Bite-verified by reverting the rule: `>= 2` in place of `== 2` makes "slow"
+    fill, and dropping the clause entirely makes "wick_at_1" fill.
     """
     p = PARAMS_DEFAULT
-    one = episodes(_fx_tape(_fx_bars(pullback="onebar")), p)
-    assert not [e for e in one if e["kind"] in ("filled", "expired")], one
-    assert [e for e in one if e["kind"] == "leg_died"], one   # the leg DID live
+    for v in ("wick_at_1", "slow"):
+        eps = episodes(_fx_tape(_fx_bars(pullback=v)), p)
+        assert not [e for e in eps if e["kind"] in ("filled", "expired")], (v, eps)
+        assert [e for e in eps if e["kind"] == "leg_died"], (v, eps)  # leg lived
 
-    two = episodes(_fx_tape(_fx_bars(pullback="twobar")), p)
-    f = [e for e in two if e["kind"] == "filled"]
-    assert len(f) == 1, [(e["kind"], e["trig_kind"]) for e in two]
+    hit = episodes(_fx_tape(_fx_bars(pullback="wick_at_2")), p)
+    f = [e for e in hit if e["kind"] == "filled"]
+    assert len(f) == 1, [(e["kind"], e["trig_kind"]) for e in hit]
     assert f[0]["trig_kind"] == "hammer" and f[0]["dir"] == -1, f[0]
-    print("two-bar pullback OK")
+    print("fast-pullback window OK")
 
 
 def _selfcheck_attempt_gate():
@@ -1141,7 +1170,7 @@ if __name__ == "__main__":
     _selfcheck_zones()
     _selfcheck_episodes()
     _selfcheck_episodes_negative()
-    _selfcheck_two_bar_pullback()
+    _selfcheck_fast_pullback_window()
     _selfcheck_attempt_gate()
     _selfcheck_cross_leg_gate()
     _selfcheck_ttl_wall_clock()

@@ -186,7 +186,7 @@ are internal constants, not parameters (dial bloat burned a search ledger before
 | Triggers | `use_engulfing` / `use_hammer` / `use_doji_star` | true / true / true | no |
 | Entry | `entry_offset_ticks` | 2 | no |
 | | `entry_ttl_bars` | 6 | no |
-| Exits | `stop_buffer_atr30` | **1.25** | **yes** — p80, re-frozen 2026-08-05 under the ≥2-bar amendment |
+| Exits | `stop_buffer_atr30` | **1.30** | **yes** — p80, re-frozen 2026-08-05 under Amendment 2 |
 | | `target_r` | 1.5 | no |
 | | `breakeven_at_r` / `be_offset_ticks` | 0 (off) / 4 | no |
 | Size/guards | `contracts` | 1 | no |
@@ -207,24 +207,25 @@ full-sample figure snapped to 0.05, warmup bars of each session excluded.
 | `leg_min_atr15` | p40 max departure from the zone edge ≤30 min after a touch | 0.30 | 0.390, n=2836 | 1.33 | **0.40** |
 | `impulse_min_atr30` | p50 leg extension at pullbacks that made a NEW extreme | 3.20 | 2.707, n=1633 | 1.19 | **2.70** |
 | `pullback_min_atr30` | p30 retracement depth of those same pullbacks | 1.15 | 1.139, n=1633 | 1.00 | **1.15** |
-| `stop_buffer_atr30` | p80 adverse pierce past the trigger-time pullback extreme | 1.30 | 1.234, n=370 | 1.04 | **1.25** |
+| `stop_buffer_atr30` | p80 adverse pierce past the trigger-time pullback extreme | 1.20 | 1.307, n=310 | 1.08 | **1.30** |
 
 Pre-registered regime gate (>2× disagreement between the two windows blocks a
 freeze): **PASS**, worst ratio 1.33. Dependency order was single-pass
 `zone_width → leg_min → impulse/pullback → stop_buffer`; no dial was re-picked
 after seeing a downstream result.
 
-`stop_buffer_atr30` was **re-frozen once** (1.30 → 1.25) under the §3 ≥2-bar
-amendment, which moves the trigger later and so changes the pierce population.
-That pass was pre-registered, ran alone, and re-passed the gate at 1.04. The other
-four dials reproduce to the digit under the amendment — it gates the hunt, not the
-retracement distributions they are measured from.
+`stop_buffer_atr30` has been **re-frozen once per amendment**, each time alone and
+pre-registered: 1.30 → 1.25 under Amendment 1, then **1.25 → 1.30 under Amendment 2**
+(raw 1.307, CI [0.95, 1.66], n=310; recent 1.20, ratio 1.08 — gate PASS). Each
+amendment changes which pullbacks reach a trigger at all, so it changes the pierce
+population. The other four dials reproduce to the digit under both — the amendments
+gate WHEN the hunt may arm, not the retracement distributions they are measured from.
 
-What the frozen dials imply, full sample: **4.81 episodes/session, 1.47 fills/session**,
-risk per trade p50 **125 ticks ($626 at 1 NQ)**, p90 225 ticks ($1,124), max 746 ticks
-($3,728). A $1,200 prop daily-loss limit absorbs roughly *one* p90 stop-out (≈91% of
-it) or two median ones — 1 contract only on NQ at that envelope, MNQ below a $50k
-account, and the risk manager has veto.
+What the frozen dials imply under Amendment 2, full sample: **4.73 episodes/session,
+1.40 fills/session**, risk per trade p50 **127 ticks ($637 at 1 NQ)**, p90 227 ticks
+($1,137), max 609 ticks ($3,044). A $1,200 prop daily-loss limit absorbs roughly *one*
+p90 stop-out (≈95% of it) or two median ones — 1 contract only on NQ at that envelope,
+MNQ below a $50k account, and the risk manager has veto.
 
 ### Audit trail (keep — this is the durable record)
 
@@ -254,11 +255,16 @@ account, and the risk manager has veto.
 
 ### Findings that survive the freeze (carry into `docs/validation.md`)
 
-1. **The one-bar pullback is fixed, structurally.** It was 66% of armed hunts (77%
-   at the provisional floor); the ≥2-bar amendment makes lag 1 impossible. Of what
-   remains: lag 2 = 85.0%, lag 3 = 6.9%, lag 4 = 2.9%, lag ≥5 = 5.2%, median 2 bars.
-   The pullback is now *at minimum* two bars, but it is still typically **exactly**
-   two — this bought structure, not depth.
+1. **One-bar delivery is ACCEPTED BY DECISION, not fixed — and it is the majority
+   case.** Amendment 1 was a latency rule, not a span rule: it delayed arming without
+   changing who delivered the depth. Amendment 2 replaces it with an exact window and
+   the owner's ruling that sharp pullbacks are the *desired* mode ("1 mecha vale, tope
+   2 barras"). Measured under Amendment 2: the arming lag is 2 by construction (100%),
+   and **75.0% of armed hunts had the floor already cleared by the single bar at
+   ext+1** (82.1% at the provisional floor). The window concentrates one-bar delivery
+   rather than reducing it. This is a design choice with a live risk attached — see
+   `docs/validation.md`, where the feasibility study's single-bar-noise suspicion
+   stays pre-registered for V2. The burden of proof is unchanged.
 2. **Zone touches are mostly drift, not rejections.** A band of 0.30 × ATR15 touches
    60% of pivot levels, but catching a *confirmed swing rejection* 60% of the time
    would need ≈1.5 × ATR15 — five times wider. The zone premise is weaker than the

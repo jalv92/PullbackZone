@@ -301,7 +301,8 @@ def leg_walk(D, p, floors=None):
     leg, live, zi, prev_day, n_legs = None, [], 0, -1, 0
 
     def start_ep(px, i, a30):
-        leg.update(ext=px, ext_i=i, pull=px, depth=0.0, trig_i=-1, hunt_i=-1,
+        leg.update(ext=px, ext_i=i, pull=px, pull_i=i, depth=0.0, depth1=0.0,
+                   trig_i=-1, hunt_i=-1, hunt=False, deliver1=False,
                    anchor=0.0, pierce=0.0,
                    ext_norm=leg["dir"] * (px - leg["arm_px"]) / a30)
 
@@ -311,7 +312,8 @@ def leg_walk(D, p, floors=None):
         rows.append((leg["ext_norm"], leg["depth"], continued,
                      leg["pierce"] if leg["trig_i"] >= 0 else np.nan,
                      bool(warm30[leg["ext_i"]]),
-                     leg["hunt_i"] - leg["ext_i"] if leg["hunt_i"] >= 0 else -1))
+                     leg["hunt_i"] - leg["ext_i"] if leg["hunt_i"] >= 0 else -1,
+                     leg["deliver1"]))
 
     for i in range(n30):
         while zi < len(zs) and zs[zi]["i0"] <= i:
@@ -382,20 +384,29 @@ def leg_walk(D, p, floors=None):
             start_ep(e, i, a30v)
             continue
         if d * (adverse - leg["pull"]) < 0:
-            leg["pull"] = adverse
+            leg["pull"], leg["pull_i"] = adverse, i
         leg["depth"] = max(leg["depth"], d * (leg["ext"] - leg["pull"]) / a30v)
+        if i == leg["ext_i"] + 1:
+            leg["depth1"] = leg["depth"]      # depth after ONE bar of pullback
         if floors is None:
             continue
         if not leg["impulse"]:
             leg["impulse"] = d * (leg["ext"] - leg["arm_px"]) >= imp_f * a30v
-        # Spec amendment 2026-08-05: the hunt arms no earlier than the close of
-        # the SECOND bar after the leg extreme. Mirrors `episodes` exactly --
-        # the measurement population has to be the one the machine trades.
-        if not leg["impulse"] or leg["depth"] < pb_f or i - leg["ext_i"] < 2:
-            continue
-        if leg["hunt_i"] < 0:
-            leg["hunt_i"] = i           # bars from the extreme to the arming
-        if leg["trig_i"] >= 0:
+        # Amendment 2, the fast-pullback window: arms at EXACTLY ext_i + 2.
+        # Mirrors `episodes` -- the measured population has to be the traded
+        # one -- including the latch, so the trigger candle may still land on a
+        # later bar even though the arming decision happens only at that one.
+        if not leg["hunt"] and i == leg["ext_i"] + 2:
+            leg["hunt"] = leg["impulse"] and leg["depth"] >= pb_f
+            if leg["hunt"]:
+                leg["hunt_i"] = i
+                # Had the floor ALREADY been cleared one bar after the
+                # extreme? Not "was the extreme last set there" -- a later bar
+                # deepening it does not undo a pullback that was already deep
+                # enough. The window pins the lag, so this is the only honest
+                # read left on "was it one bar of noise".
+                leg["deliver1"] = leg["depth1"] >= pb_f
+        if not leg["hunt"] or leg["trig_i"] >= 0:
             continue
         if p["use_engulfing"] and candle_engulfing(o30, h30, l30, c30, i, d):
             pass
@@ -411,12 +422,12 @@ def leg_walk(D, p, floors=None):
     if not rows:
         return dict(legs=n_legs, **{k: np.zeros(0) for k in
                                     ("ext", "depth", "cont", "pierce",
-                                     "warm", "lag")})
+                                     "warm", "lag", "d1")})
     a = np.array(rows, dtype=object)
     return dict(legs=n_legs, ext=a[:, 0].astype(float),
                 depth=a[:, 1].astype(float), cont=a[:, 2].astype(bool),
                 pierce=a[:, 3].astype(float), warm=a[:, 4].astype(bool),
-                lag=a[:, 5].astype(int))
+                lag=a[:, 5].astype(int), d1=a[:, 6].astype(bool))
 
 
 # ------------------------------------------------------------------- staging
@@ -637,23 +648,27 @@ def main():
               f" -> {bar_range_rate(D, PROVISIONAL['pullback_min_atr30']):6.1%}"
               f"   now {pb:.2f} -> {bar_range_rate(D, pb):6.1%}"
               f"   |  impulse floor {im:.2f} -> {bar_range_rate(D, im):6.1%}")
-    print("\n  ...and IN SITU: how many bars after the leg extreme the hunt")
-    print("  actually armed. The >=2-bar amendment makes lag 1 structurally")
-    print("  impossible, so this is the shape of what is left:")
+    print("\n  ...and IN SITU. Amendment 2 pins the arming LAG at exactly 2 by")
+    print("  construction, so the lag histogram is now tautological and the")
+    print("  honest question is DELIVERY: of the hunts that armed at ext+2, how")
+    print("  many had the whole depth handed over by the single bar at ext+1?")
+    print("  That is the owner's accepted design (\"1 mecha vale\") AND the")
+    print("  feasibility study's live suspicion -- it stays measured, not hidden.")
     p_fro = dict(PARAMS_DEFAULT, **frozen)
     for label, _ in wins:
         D = res[label]["D"]
         for nm, floor in ((f"provisional {PROVISIONAL['pullback_min_atr30']:.2f}",
                            PROVISIONAL["pullback_min_atr30"]),
                           (f"frozen {pb:.2f}", pb)):
-            lag = leg_walk(D, p_fro, floors=(im, floor))["lag"]
-            lag = lag[lag > 0]
-            if not len(lag):
+            r = leg_walk(D, p_fro, floors=(im, floor))
+            lag, d1 = r["lag"], r["d1"]
+            armed = lag > 0
+            if not armed.any():
                 continue
-            hist = "  ".join(f"lag{v}: {np.mean(lag == v):5.1%}"
-                             for v in (1, 2, 3, 4))
-            print(f"    {label:<10} {nm:<18} armed {len(lag):5}  {hist}  "
-                  f"lag>=5: {np.mean(lag >= 5):5.1%}  median {int(np.median(lag))}")
+            print(f"    {label:<10} {nm:<18} armed {int(armed.sum()):5}  "
+                  f"lag==2: {np.mean(lag[armed] == 2):6.1%}  "
+                  f"depth delivered by the ext+1 bar alone: "
+                  f"{np.mean(d1[armed]):6.1%}")
 
     print("\n" + "=" * 100)
     print("WHAT THE VALUES IMPLY (behaviour and stop DISTANCE, never P&L)")
