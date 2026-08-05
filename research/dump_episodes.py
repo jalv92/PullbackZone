@@ -7,7 +7,7 @@ PROPSIM = Path(__file__).resolve().parents[2] / "PropSim"
 sys.path.insert(0, str(PROPSIM))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "propsim"))
 import tape
-from pullback_zone import episodes, PARAMS_PROVISIONAL
+from pullback_zone import episodes, PARAMS_DEFAULT
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--contract", default="ALL")
@@ -18,7 +18,7 @@ t = tape.load_cache(a.contract, a.start, a.end)
 t = tape.slice_range(t, a.start, a.end, rth_only=True)
 with open(a.out, "w") as f:
     n = 0
-    for e in episodes(t, dict(PARAMS_PROVISIONAL)):
+    for e in episodes(t, dict(PARAMS_DEFAULT)):
         # trig_ts defaults to -1 for terminal episodes with no trigger (leg_died,
         # no_attempt_left) -- `or` does not fall through here, -1 is truthy.
         anchor = e["trig_ts"] if e["trig_ts"] >= 0 else e["leg_arm_ts"]

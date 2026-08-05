@@ -34,19 +34,44 @@ TICK = 0.25
 _TPS = 10_000_000                      # .NET ticks per second
 _NET_EPOCH_S = 62135596800             # seconds from 0001-01-01 to 1970-01-01
 
-# Provisional values marked CALIBRATE are frozen by research/calibrate.py
-# (Task 4) and then updated HERE and in the spec table. Never sweep them.
-PARAMS_PROVISIONAL = dict(
+# The five CALIBRATED dials are FROZEN. `research/calibrate.py` picked each
+# from a percentile of market BEHAVIOUR on the PropSim ALL tape -- 238 RTH
+# sessions of real NQ ticks, 2025-08-03 .. 2026-08-04, ATR-warmup bars of each
+# session excluded -- with no profit metric anywhere in the derivation. Every
+# value below is the FULL-sample figure snapped to 0.05; the last-30-session
+# window agreed within 1.33x on all five (the pre-registered gate was 2x).
+# Re-running calibrate.py on the same tape reprints the same table.
+#
+# Changing one of these is a new pre-registered run, not a tweak. Never sweep
+# them: a search would re-open the decision with the one criterion the
+# calibration deliberately refused.
+PARAMS_DEFAULT = dict(
     zone_pivot_k=3, zone_min_touches=2,
-    zone_width_atr15=0.25,          # CALIBRATE
+    # p60 of the nearest later bar approach to a live 15m pivot, ATR15s
+    # (raw 0.30, 95% CI [0.26, 0.36], n=547): the half-width at which 60% of
+    # pivot levels are touched at all.
+    zone_width_atr15=0.30,
     zone_expiry_sessions=2, zone_break_atr15=0.25,
-    leg_min_atr15=0.50,             # CALIBRATE
+    # p40 of the max departure from a zone EDGE within 30 min of a touch
+    # (raw 0.40, CI [0.38, 0.41], n=2836): below it departures chop back.
+    leg_min_atr15=0.40,
     leg_timeout_min=60, max_attempts_per_leg=2,
-    impulse_min_atr30=2.0,          # CALIBRATE
-    pullback_min_atr30=1.0,         # CALIBRATE
+    # p50 of the leg extension at pullbacks that went on to a NEW extreme
+    # (raw 2.71, CI [2.56, 2.89], n=1633). Clears single-bar noise by a wide
+    # margin: only 0.4% of 30s bars have a range this big on their own.
+    impulse_min_atr30=2.70,
+    # p30 of the retracement depth of those same continuation pullbacks
+    # (raw 1.15, CI [1.10, 1.19]). KNOWN WEAKNESS, see docs/validation.md:
+    # 66% of the hunts this floor arms are still armed by ONE bar of
+    # counter-move. The floor is what the pre-registered rule returned; making
+    # a pullback span 2+ bars is a spec change, not a calibration.
+    pullback_min_atr30=1.15,
     use_engulfing=1, use_hammer=1, use_doji_star=1,
     entry_offset_ticks=2, entry_ttl_bars=6,
-    stop_buffer_atr30=0.50,         # CALIBRATE
+    # p80 of the adverse pierce past the trigger-time pullback extreme among
+    # pullbacks that did continue (raw 1.28, CI [0.94, 1.58], n=412). 2.6x the
+    # provisional -- Javier's "real NQ volatility, not token ticks", measured.
+    stop_buffer_atr30=1.30,
     target_r=1.5, breakeven_at_r=0.0, be_offset_ticks=4,
     contracts=1, daily_loss_r=0.0, flatten_hhmm=1558,
 )
@@ -289,6 +314,13 @@ def _resolve_exit(ts, px, et, d, stop_px, target_px, flat_ts):
     SESSION FLATTEN rather than by the leg's timeout, because a position
     outlives the leg that opened it and is managed by its brackets and the
     flatten backstop alone (spec 2, last bullet).
+
+    Models the original stop, the target and the flatten ONLY: it omits the
+    engine's breakeven stop, its 240-minute position horizon and its tape-gap
+    exit, all of which exit EARLIER -- the safe direction for a gate that
+    blocks new entries. Revisit before enabling `breakeven_at_r`: a breakeven
+    exit would come back here labelled "stopped", granting an attempt 2 the
+    spec does not.
     """
     seg = px[et + 1:int(np.searchsorted(ts, flat_ts, "right"))]
     if d > 0:
@@ -451,7 +483,9 @@ def episodes(tape, p):
             leg["hunt"] = (d * (leg["ext"] - leg["pull"])
                            >= p["pullback_min_atr30"] * a30)
         if not leg["hunt"] or i <= leg["block"]:
-            continue                        # one working entry at a time
+            continue        # `block`: this leg's own re-arm gate after a fill
+                            # (see the attempt bookkeeping below). "One working
+                            # entry at a time" is the global `busy` gate now.
 
         # --- trigger. Order is the spec's, and it is the tie-break when one
         # bar matches two: engulfing, then hammer, then doji.
@@ -572,25 +606,25 @@ class PullbackZone(Strategy):
         # research/calibrate.py picks them from percentiles of market
         # behaviour, never from P&L. Sweeping them re-opens that decision with
         # the one criterion the calibration deliberately refused.
-        "zone_width_atr15": Param(0.25, 0.05, 2.0, "zone half-width, ATR15s",
+        "zone_width_atr15": Param(0.30, 0.05, 2.0, "zone half-width, ATR15s",
                                   fixed=True),
         "zone_expiry_sessions": Param(2, 1, 20, "sessions a zone survives",
                                       fixed=True),
         "zone_break_atr15": Param(0.25, 0.0, 2.0, "close beyond the far edge "
                                                   "that kills a zone, ATR15s"),
-        "leg_min_atr15": Param(0.50, 0.1, 3.0, "departure from the zone edge "
+        "leg_min_atr15": Param(0.40, 0.1, 3.0, "departure from the zone edge "
                                                "that arms a leg, ATR15s",
                                fixed=True),
         "leg_timeout_min": Param(60, 5, 390, "a leg stops arming entries after "
                                              "this long, minutes", fixed=True),
         "max_attempts_per_leg": Param(2, 1, 5, "fills allowed per leg",
                                       fixed=True),
-        "impulse_min_atr30": Param(2.0, 0.5, 8.0, "extension from the arming "
-                                                  "point before a pullback "
-                                                  "counts, ATR30s", fixed=True),
-        "pullback_min_atr30": Param(1.0, 0.2, 5.0, "counter-move from the leg "
-                                                   "extreme that arms the "
-                                                   "hunt, ATR30s", fixed=True),
+        "impulse_min_atr30": Param(2.70, 0.5, 8.0, "extension from the arming "
+                                                   "point before a pullback "
+                                                   "counts, ATR30s", fixed=True),
+        "pullback_min_atr30": Param(1.15, 0.2, 5.0, "counter-move from the leg "
+                                                    "extreme that arms the "
+                                                    "hunt, ATR30s", fixed=True),
         "use_engulfing": Param(1, 0, 1, "engulfing trigger", fixed=True),
         "use_hammer": Param(1, 0, 1, "hammer / shooting-star trigger", fixed=True),
         "use_doji_star": Param(1, 0, 1, "doji-star trigger", fixed=True),
@@ -598,7 +632,7 @@ class PullbackZone(Strategy):
                                               "candle's extreme, ticks", fixed=True),
         "entry_ttl_bars": Param(6, 1, 40, "working life of the entry, 30s bars",
                                 fixed=True),
-        "stop_buffer_atr30": Param(0.50, 0.05, 3.0, "stop beyond the pullback "
+        "stop_buffer_atr30": Param(1.30, 0.05, 3.0, "stop beyond the pullback "
                                                     "extreme, ATR30s", fixed=True),
         "target_r": Param(1.5, 0.5, 6.0, "target as a multiple of risk"),
         "breakeven_at_r": Param(0.0, 0.0, 5.0, "move the stop to entry at this "
@@ -799,9 +833,10 @@ def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False, after="continue"):
     else:
         ramp(19, 110.0, 104.0)              # 15    departs -> leg arms
         # Wickless: a wick on a descending bar reaches back above the running
-        # low, and at the PROVISIONAL pullback_min (1.0 x ATR30s, which the
-        # spec itself says is about one bar's range and is what calibration
-        # exists to fix) that is enough to arm the hunt mid-impulse.
+        # low, and at the frozen pullback_min (1.15 x ATR30s) one such wick is
+        # still enough to arm the hunt mid-impulse -- calibration measured that
+        # weakness rather than removing it (66% of armed hunts arm on a single
+        # bar), so the fixture must keep dodging it to isolate what it tests.
         ramp(30, 104.0, leg_low, w=0.0)     # 16    impulse
     lvl = rise(leg_low, leg_low + 2.0)      # 17+   pullback
     star(lvl + 1.0)                         # ATTEMPT 1: trigger + fill
@@ -864,7 +899,7 @@ def _fx_tape(bars30, sod0=9 * 3600 + 30 * 60, day0=20000, split_at=None):
 
 def _selfcheck_episodes():
     t = _fx_tape(_fx_bars())
-    eps = episodes(t, PARAMS_PROVISIONAL)
+    eps = episodes(t, PARAMS_DEFAULT)
     filled = [e for e in eps if e["kind"] == "filled"]
     assert len(filled) == 1, [e["kind"] for e in eps]
     e = filled[0]
@@ -873,7 +908,7 @@ def _selfcheck_episodes():
     assert e["stop_px"] > e["entry_stop_px"] > e["target_px"], e
     # stop = pullback extreme + buffer:
     assert abs(e["stop_px"] - (e["pull_ext_px"]
-                               + PARAMS_PROVISIONAL["stop_buffer_atr30"]
+                               + PARAMS_DEFAULT["stop_buffer_atr30"]
                                * e["atr30"])) < 1e-6, e
     # no-lookahead invariant (the 10f discipline): truncate the tape one tick
     # after the fill -> same stop/target on the filled episode. It BITES:
@@ -881,7 +916,7 @@ def _selfcheck_episodes():
     # reading the bar the fill lands in (a forming-bar ATR, a pullback extreme
     # extended past the trigger) changes here and nowhere else.
     t2 = {k: v[: e["entry_tick"] + 2] for k, v in t.items()}
-    e2 = [x for x in episodes(t2, PARAMS_PROVISIONAL) if x["kind"] == "filled"][0]
+    e2 = [x for x in episodes(t2, PARAMS_DEFAULT) if x["kind"] == "filled"][0]
     assert (e2["stop_px"], e2["target_px"]) == (e["stop_px"], e["target_px"])
     print("episodes OK")
 
@@ -891,7 +926,7 @@ def _selfcheck_episodes_negative():
     them pairs "nothing fired" with a control that fires, because a check that
     only ever asserts an empty list passes just as happily when the fixture
     stopped producing a setup at all."""
-    p = PARAMS_PROVISIONAL
+    p = PARAMS_DEFAULT
 
     # (a) no second touch -> the pivot never becomes a zone, so nothing arms.
     # The retest in block 15 does supply a second 15m touch, but it lands in
@@ -937,7 +972,7 @@ def _selfcheck_episodes_negative():
 
 def _selfcheck_attempt_gate():
     """Spec 7: the second attempt exists only if the first fill STOPS OUT."""
-    p = PARAMS_PROVISIONAL
+    p = PARAMS_DEFAULT
 
     t = _fx_tape(_fx_bars(after="stopout"))
     eps = episodes(t, p)
@@ -965,7 +1000,7 @@ def _selfcheck_attempt_gate():
 def _selfcheck_cross_leg_gate():
     """Flat to flat, GLOBALLY: a second leg at a second zone may not enter
     while an earlier leg's position is still open, and may once it is not."""
-    p = PARAMS_PROVISIONAL
+    p = PARAMS_DEFAULT
     t = _fx_tape(_fx_bars(after="crossleg"))
     eps = episodes(t, p)
     f = [e for e in eps if e["kind"] == "filled"]
@@ -990,7 +1025,7 @@ def _selfcheck_cross_leg_gate():
 def _selfcheck_ttl_wall_clock():
     """entry_ttl_bars is wall clock: a hole in the tape must expire the entry,
     not carry it to whatever bar index happens to be six slots later."""
-    p = PARAMS_PROVISIONAL
+    p = PARAMS_DEFAULT
     bars = _fx_bars()
     t = _fx_tape(bars)
     e = [x for x in episodes(t, p) if x["kind"] == "filled"][0]
@@ -1009,21 +1044,21 @@ def _selfcheck_strategy():
     """The engine's contract, checked here rather than discovered by
     plugins.check_output on a real tape."""
     s = PullbackZone()
-    assert s.risk_ticks(PARAMS_PROVISIONAL) == _SANITY_STOP_TICKS
+    assert s.risk_ticks(PARAMS_DEFAULT) == _SANITY_STOP_TICKS
     for k in s.params:                      # the closed list, both directions
-        assert k in PARAMS_PROVISIONAL, k
-    for k, v in PARAMS_PROVISIONAL.items():
+        assert k in PARAMS_DEFAULT, k
+    for k, v in PARAMS_DEFAULT.items():
         assert k in s.params, k
         assert s.params[k].lo <= v <= s.params[k].hi, k
         assert s.params[k].default == v, k
 
     # A COPY: entries() writes the breakeven-offset alias into the dict it is
-    # handed (the only channel the engine reads it on), and PARAMS_PROVISIONAL
+    # handed (the only channel the engine reads it on), and PARAMS_DEFAULT
     # is the module's source of truth for the closed list -- letting a run
     # grow a key in it would make the round-trip above pass or fail depending
     # on what ran first.
     t = _fx_tape(_fx_bars())
-    pp = dict(PARAMS_PROVISIONAL)
+    pp = dict(PARAMS_DEFAULT)
     res = s.entries(None, t, pp)
     assert pp["breakeven_offset_ticks"] == pp["be_offset_ticks"]
     assert len(res) == 4
@@ -1036,10 +1071,10 @@ def _selfcheck_strategy():
 
     # Breakeven returns the engine's 6-tuple, and the sixth array is a PRICE
     # between the entry and the target -- not a fraction.
-    et2, dr2, st2, tg2, lim, be = s.entries(None, t, dict(PARAMS_PROVISIONAL,
+    et2, dr2, st2, tg2, lim, be = s.entries(None, t, dict(PARAMS_DEFAULT,
                                                           breakeven_at_r=1.0))
     assert lim is None and len(be) == len(et2)
-    ep = [x for x in episodes(t, PARAMS_PROVISIONAL) if x["kind"] == "filled"][0]
+    ep = [x for x in episodes(t, PARAMS_DEFAULT) if x["kind"] == "filled"][0]
     risk = abs(ep["stop_px"] - ep["entry_stop_px"])
     assert abs(be[0] - (ep["entry_stop_px"] - 1.0 * risk)) < 1e-9, be[0]
     assert tg2[0] < be[0] < st2[0], be[0]

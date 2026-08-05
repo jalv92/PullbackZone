@@ -54,7 +54,7 @@ The only tick-resolution elements are the resting orders themselves.
   original side.
 - A zone is a **band**, not a line: `pivot_price ± zone_width_atr15 × ATR15`.
 - A zone dies when a 15m bar closes beyond the far edge by more than
-  `zone_break_atr15 × ATR15` (clean break), or after `zone_expiry` (age).
+  `zone_break_atr15 × ATR15` (clean break), or after `zone_expiry_sessions` (age).
 - Overlapping zones within one band-width merge (keep the older, more-touched one).
 
 ### 2. LEG
@@ -96,12 +96,12 @@ are internal constants, not parameters (dial bloat burned a search ledger before
 
 ### 6. EXITS
 
-- **Stop loss:** beyond the pullback extreme by `stop_buffer` (data-calibrated;
+- **Stop loss:** beyond the pullback extreme by `stop_buffer_atr30` (data-calibrated;
   see Calibration — NOT a token 1–2 ticks, per Javier's explicit correction).
 - **Target:** `target_r` × risk (risk = entry − stop distance).
 - Brackets are hand-movable (NT8 side): the strategy adopts dragged SL/TP.
 - Optional breakeven at `breakeven_at_r` (0 = off) with `be_offset_ticks`.
-- Session backstop: flatten at `flatten_time` (default 15:58 ET), lockout after.
+- Session backstop: flatten at `flatten_hhmm` (default 1558 = 15:58 ET), lockout after.
 
 ### 7. RE-ENTRY
 
@@ -157,41 +157,68 @@ are internal constants, not parameters (dial bloat burned a search ledger before
 |---|---|---|---|
 | Zones | `zone_pivot_k` | 3 | no |
 | | `zone_min_touches` | 2 | no |
-| | `zone_width_atr15` | TBD by calibration | **yes** |
-| | `zone_expiry` | 2 sessions | no |
+| | `zone_width_atr15` | **0.30** | **yes** — p60, frozen 2026-08-05 |
+| | `zone_expiry_sessions` | 2 sessions | no |
 | | `zone_break_atr15` | 0.25 | no |
-| Leg | `leg_min_atr15` | TBD by calibration | **yes** |
+| Leg | `leg_min_atr15` | **0.40** | **yes** — p40, frozen 2026-08-05 |
 | | `leg_timeout_min` | 60 | no |
 | | `max_attempts_per_leg` | 2 | no |
-| Pullback | `impulse_min_atr30` | TBD by calibration | **yes** |
-| | `pullback_min_atr30` | TBD by calibration | **yes** |
+| Pullback | `impulse_min_atr30` | **2.70** | **yes** — p50, frozen 2026-08-05 |
+| | `pullback_min_atr30` | **1.15** | **yes** — p30, frozen 2026-08-05 |
 | Triggers | `use_engulfing` / `use_hammer` / `use_doji_star` | true / true / true | no |
 | Entry | `entry_offset_ticks` | 2 | no |
 | | `entry_ttl_bars` | 6 | no |
-| Exits | `stop_buffer` | TBD by calibration | **yes** |
+| Exits | `stop_buffer_atr30` | **1.30** | **yes** — p80, frozen 2026-08-05 |
 | | `target_r` | 1.5 | no |
 | | `breakeven_at_r` / `be_offset_ticks` | 0 (off) / 4 | no |
 | Size/guards | `contracts` | 1 | no |
 | | `daily_loss_r` | 0 (off; in R, never dollars) | no |
-| Session | window fixed 09:30–16:00 ET; `flatten_time` | 15:58 | no |
+| Session | window fixed 09:30–16:00 ET; `flatten_hhmm` | 1558 | no |
 
-## Calibration (before defaults freeze — no P&L optimization)
+## Calibration — DONE and FROZEN 2026-08-05 (no P&L optimization)
 
-`research/calibrate.py` runs once on the real tape (last 30 sessions AND the full
-238-session sample, reported side by side) and picks defaults as **percentiles of
-market behavior, never by profit**:
+`research/calibrate.py` ran once on the PropSim ALL tape (238 RTH sessions of real
+NQ ticks, 2025-08-03 → 2026-08-04), reporting the last 30 sessions and the full
+sample side by side. Every default is a **percentile of market behavior**; no
+profit, win rate or R multiple is computed anywhere in that file. Values are the
+full-sample figure snapped to 0.05, warmup bars of each session excluded.
 
-- `stop_buffer`: p80 of the adverse pierce beyond the pullback extreme among legs
-  that DID continue (Javier's explicit requirement: the buffer must reflect real NQ
-  volatility, not a token tick count).
-- `impulse_min_atr30`, `pullback_min_atr30`: percentile floors such that the
-  impulse is a genuine multi-bar move (the feasibility study showed 1.0 × ATR30s ≈
-  one bar's range — too small; the default must clear single-bar noise).
-- `zone_width_atr15`, `leg_min_atr15`: distribution of retest distances around 15m
-  pivot levels.
+| Dial | Rule | Recent 30 | Full 238 | Ratio | **Frozen** |
+|---|---|---|---|---|---|
+| `zone_width_atr15` | p60 nearest later bar approach to a live pivot | 0.30 | 0.30 | 1.00 | **0.30** |
+| `leg_min_atr15` | p40 max departure from the zone edge ≤30 min after a touch | 0.30 | 0.40 | 1.33 | **0.40** |
+| `impulse_min_atr30` | p50 leg extension at pullbacks that made a NEW extreme | 3.20 | 2.70 | 1.19 | **2.70** |
+| `pullback_min_atr30` | p30 retracement depth of those same pullbacks | 1.15 | 1.15 | 1.00 | **1.15** |
+| `stop_buffer_atr30` | p80 adverse pierce past the trigger-time pullback extreme | 1.30 | 1.30 | 1.00 | **1.30** |
 
-Chosen values are written back into this spec and frozen. Any later change is a
-new pre-registered run, not a tweak.
+Pre-registered regime gate (>2× disagreement between the two windows blocks a
+freeze): **PASS**, worst ratio 1.33. Dependency order was single-pass
+`zone_width → leg_min → impulse/pullback → stop_buffer`; no dial was re-picked
+after seeing a downstream result.
+
+What the frozen dials imply, full sample: **4.82 episodes/session, 1.47 fills/session**,
+risk per trade p50 **123 ticks ($617 at 1 NQ)**, p90 243 ticks ($1,216), max 754 ticks.
+A $1,200 prop daily-loss limit is therefore roughly *one* p90 stop-out or two median
+ones — the strategy is 1-contract-only on NQ at that envelope, and the risk manager
+has veto.
+
+Three findings that survive the freeze and belong in `docs/validation.md`:
+
+1. **The pullback is usually one bar.** 66% of the hunts the frozen floor arms are
+   armed by a single 30s bar of counter-move (77% at the old 1.00 floor). Raising
+   the floor per the pre-registered rule reduced the problem without fixing it.
+   Requiring a pullback to span ≥2 bars is a **spec change**, not a recalibration —
+   it must be its own pre-registered run.
+2. **Zone touches are mostly drift, not rejections.** A band of 0.30 × ATR15 touches
+   60% of pivot levels, but catching a *confirmed swing rejection* 60% of the time
+   would need ≈1.5 × ATR15 — five times wider. The zone premise is weaker than the
+   design assumed.
+3. **Early-session ATR is elevated by real volatility, not mainly by the gap.** The
+   raw 30s bar range averages 38.8 pts at the open vs 11.4 pts later, so the
+   no-session-reset ATR convention costs less than feared; excluding warmup bars
+   moved no dial by more than 0.10.
+
+Any later change to a frozen value is a new pre-registered run, not a tweak.
 
 ## Validation (pre-registered order)
 
