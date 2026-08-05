@@ -54,28 +54,31 @@ def candle_doji(o, h, l, c, i):
 def wilder_atr(h, l, c, n, day):
     """Wilder ATR over closed bars, NaN warmup, resets at each session.
 
-    A session's opening bar has no legitimate prior close to compare
-    against (the previous session's close does not count -- true range must
-    never reach across the overnight gap), so it is dropped before the
-    range series even starts, exactly like bar 0 of the whole array would
-    be for a plain (non-session) ATR.
+    No bar is dropped. A session's FIRST bar has no legitimate prior close
+    (the previous session's close does not count -- true range never
+    reaches across the overnight gap), so its TR is just h - l; every later
+    bar uses the standard 3-way formula against the previous close of the
+    SAME session. Seeded per session: simple mean of that session's first n
+    TRs, Wilder smoothing after, NaN until seeded.
     """
     atr = np.full(len(c), np.nan)
     bounds = np.flatnonzero(np.diff(day)) + 1
     starts = np.concatenate(([0], bounds))
     ends = np.concatenate((bounds, [len(day)]))
     for s, e in zip(starts, ends):
-        hh, ll, cc = h[s + 1:e], l[s + 1:e], c[s + 1:e]
-        m = len(cc)
-        if m < n + 1:
+        m = e - s
+        if m < n:
             continue
-        tr = np.maximum(hh[1:] - ll[1:],
-                         np.maximum(np.abs(hh[1:] - cc[:-1]), np.abs(ll[1:] - cc[:-1])))
+        hh, ll, cc = h[s:e], l[s:e], c[s:e]
+        tr = np.empty(m)
+        tr[0] = hh[0] - ll[0]
+        tr[1:] = np.maximum(hh[1:] - ll[1:],
+                             np.maximum(np.abs(hh[1:] - cc[:-1]), np.abs(ll[1:] - cc[:-1])))
         a = tr[:n].mean()
-        atr[s + 1 + n] = a
-        for i in range(n + 1, m):
+        atr[s + n - 1] = a
+        for i in range(n, m):
             a = (a * (n - 1) + tr[i - 1]) / n
-            atr[s + 1 + i] = a
+            atr[s + i] = a
     return atr
 
 
@@ -197,12 +200,17 @@ def _selfcheck_atr_pivots():
     n = 20
     h = np.full(n, 101.0); l = np.full(n, 100.0); c = np.full(n, 100.5)
     day = np.concatenate([np.zeros(10, int), np.ones(10, int)])
-    c[9] = 100.5
-    l[10] = 90.0   # would be a giant TR only if the gap leaked across sessions
-    h[10] = 91.0; c[10] = 90.5
+    # session 2 trades 10 points lower, internally consistent: the ONLY large
+    # move is the cross-session gap, which must NOT leak into any TR.
+    h[10:] = 91.0; l[10:] = 90.0; c[10:] = 90.5
     atr = wilder_atr(h, l, c, 5, day)
     assert abs(atr[9] - 1.0) < 1e-9                     # steady 1-pt bars
     assert abs(atr[16] - 1.0) < 1e-9                    # reset: no gap contamination
+    # guard against drop-the-bar implementations: an INTRA-session jump must
+    # register. Bar 13's TR = max(5, |95-90.5|, |90-90.5|) = 5.0.
+    h2 = h.copy(); h2[13] = 95.0
+    atr2 = wilder_atr(h2, l, c, 5, day)
+    assert atr2[16] > 1.5
     hh = np.array([1, 2, 5, 2, 1, 5, 5, 1, 2.0])
     ll = hh - 1
     hi, lo = pivots(hh, ll, 2)
