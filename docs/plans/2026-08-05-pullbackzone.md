@@ -39,6 +39,9 @@
 5. `busy`/TTL anchors on the trigger bar's last-TICK timestamp, not the nominal bar boundary — cross-leg suppression inherits tick jitter. Accepted with the wall-clock TTL delta; Task 7 should not chase 1-bar edge disagreements here.
 6. The corpus carries no absolute fill timestamp (`entry_tick` is slice-relative). Task 7 joins on `trig_ts` (absolute) and must re-derive fills from an IDENTICAL tape slice — always pass an explicit `--contract` to `dump_episodes.py` (its `ALL` default spans rolls and is NOT what a Replay session compares against).
 7. Amendment 2's `i == ext_i + 2` window is CATEGORICAL under a one-bar index disagreement: where a `>=` rule would merely delay arming, a bar-boundary difference between the two sides flips arm → never-arm for that extreme. The .cs must build its 30s series so bar boundaries equal PropSim's (RTH template, 09:30 grid), and Task 7's gate watches never-armed-on-one-side disagreements as this delta's signature.
+8. `trig_ts`/`leg_arm_ts` carry a systematic (0, 30]-second offset by construction: PropSim stamps the bar's LAST TICK, NT8 stamps the NOMINAL close. Task 7 must join INCLUSIVELY (`<= 30 s`) or on the 30s slot index — an exact-30s delta is a match, not a miss.
+9. NT8's secondary-series processing pointer lags on shared timestamps (primary processes first — nt8-educational multi-TF reference). The .cs therefore folds 15m bars by ABSOLUTE index (`BarsArray[idx].GetTime(j)` etc.) with the `> Time[0]` break guard as the ONLY no-lookahead invariant — that guard must never be weakened. Reading the secondary through barsAgo accessors reintroduces a deterministic one-30s-bar lag at every 15m boundary (Task 5's Critical).
+10. Task 6 retires the detection-only `kind: "trigger"` corpus rows (the Python vocabulary has no fifth kind) — the joiner never special-cases it.
 
 ---
 
