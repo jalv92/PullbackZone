@@ -51,35 +51,32 @@ def candle_doji(o, h, l, c, i):
     return rng > 0 and abs(c[i] - o[i]) <= _DOJI_BODY_RNG * rng
 
 
-def wilder_atr(h, l, c, n, day):
-    """Wilder ATR over closed bars, NaN warmup, resets at each session.
+def wilder_atr(h, l, c, n):
+    """Wilder ATR over closed bars -- NinjaTrader's TrueRange/ATR recursion
+    exactly (house rule, copied from PropSim's `engine._atr_wilder`, itself
+    `LatigoBreakStrategy.cs:1009-1021`): a plain mean of the true ranges
+    seen so far until n bars exist, then `atr += (tr - atr) / n`. Defined
+    from bar 0, no NaN warmup.
 
-    No bar is dropped. A session's FIRST bar has no legitimate prior close
-    (the previous session's close does not count -- true range never
-    reaches across the overnight gap), so its TR is just h - l; every later
-    bar uses the standard 3-way formula against the previous close of the
-    SAME session. Seeded per session: simple mean of that session's first n
-    TRs, Wilder smoothing after, NaN until seeded.
+    No session reset: TrueRange reaches across the boundary, same as NT8's
+    own recursion. Deliberate, not an oversight -- unlike LatigoBreak (where
+    the reset never mattered), PullbackZone's 15m ATR window spans the
+    09:30 open every session, so this is the one convention both mirror
+    sides already reproduce exactly; a hand-rolled session reset would have
+    to be implemented twice and is exactly where mirrors diverge.
     """
-    atr = np.full(len(c), np.nan)
-    bounds = np.flatnonzero(np.diff(day)) + 1
-    starts = np.concatenate(([0], bounds))
-    ends = np.concatenate((bounds, [len(day)]))
-    for s, e in zip(starts, ends):
-        m = e - s
-        if m < n:
-            continue
-        hh, ll, cc = h[s:e], l[s:e], c[s:e]
-        tr = np.empty(m)
-        tr[0] = hh[0] - ll[0]
-        tr[1:] = np.maximum(hh[1:] - ll[1:],
-                             np.maximum(np.abs(hh[1:] - cc[:-1]), np.abs(ll[1:] - cc[:-1])))
-        a = tr[:n].mean()
-        atr[s + n - 1] = a
-        for i in range(n, m):
-            a = (a * (n - 1) + tr[i - 1]) / n
-            atr[s + i] = a
-    return atr
+    prev = np.concatenate(([c[0]], c[:-1]))
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev), np.abs(l - prev)))
+    tr[0] = h[0] - l[0]                 # no previous close to reach for
+    out = np.empty(len(tr))
+    run = 0.0
+    for i in range(len(tr)):
+        if i < n:
+            run = (run * i + tr[i]) / (i + 1)
+        else:
+            run += (tr[i] - run) / n
+        out[i] = run
+    return out
 
 
 def pivots(h, l, k):
@@ -128,7 +125,7 @@ def zones(b15, day15, p):
     break_atr = float(p["zone_break_atr15"])
     expiry = int(p["zone_expiry"])
 
-    atr15 = wilder_atr(h, l, c, _ZONE_ATR_N15, day15)
+    atr15 = wilder_atr(h, l, c, _ZONE_ATR_N15)
     hi_idx, lo_idx = pivots(h, l, k)
     reveal = {}
     for j in hi_idx:
@@ -199,18 +196,13 @@ def _selfcheck_candles():
 def _selfcheck_atr_pivots():
     n = 20
     h = np.full(n, 101.0); l = np.full(n, 100.0); c = np.full(n, 100.5)
-    day = np.concatenate([np.zeros(10, int), np.ones(10, int)])
-    # session 2 trades 10 points lower, internally consistent: the ONLY large
-    # move is the cross-session gap, which must NOT leak into any TR.
     h[10:] = 91.0; l[10:] = 90.0; c[10:] = 90.5
-    atr = wilder_atr(h, l, c, 5, day)
+    atr = wilder_atr(h, l, c, 5)
     assert abs(atr[9] - 1.0) < 1e-9                     # steady 1-pt bars
-    assert abs(atr[16] - 1.0) < 1e-9                    # reset: no gap contamination
-    # guard against drop-the-bar implementations: an INTRA-session jump must
-    # register. Bar 13's TR = max(5, |95-90.5|, |90-90.5|) = 5.0.
+    assert atr[10] > 2.0                                # the gap DOES hit TR once
+    assert 1.0 < atr[16] < atr[10]                      # ...and decays afterwards
     h2 = h.copy(); h2[13] = 95.0
-    atr2 = wilder_atr(h2, l, c, 5, day)
-    assert atr2[16] > 1.5
+    assert wilder_atr(h2, l, c, 5)[16] > atr[16]        # intra-session jump registers
     hh = np.array([1, 2, 5, 2, 1, 5, 5, 1, 2.0])
     ll = hh - 1
     hi, lo = pivots(hh, ll, 2)
