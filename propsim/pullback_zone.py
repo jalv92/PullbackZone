@@ -7,7 +7,44 @@ Sandbox rule: imports limited to math/numpy so plugins.py --check passes.
 """
 import numpy as np
 
+# The PropSim sandbox hands a plugin `Strategy`, `Param` and `np` in its
+# namespace instead of letting it import them. Standalone (running this file
+# for its selfchecks, or from research/) they are simply absent, so stand-ins
+# are defined and the class below degrades to a plain object. NameError rather
+# than `try: from engine import ...` because plugins.py's AST check walks the
+# WHOLE tree -- an import inside a try/except is still an import node, and is
+# rejected exactly like a bare one (verified against plugins.ast_check).
+try:
+    Strategy
+except NameError:
+    class Strategy:                      # pragma: no cover - sandbox stand-in
+        pass
+
+    class Param:                         # pragma: no cover - sandbox stand-in
+        def __init__(self, default, lo, hi, desc, fixed=False):
+            self.default, self.lo, self.hi = default, lo, hi
+            self.desc, self.fixed = desc, fixed
+
 TICK = 0.25
+_TPS = 10_000_000                      # .NET ticks per second
+_NET_EPOCH_S = 62135596800             # seconds from 0001-01-01 to 1970-01-01
+
+# Provisional values marked CALIBRATE are frozen by research/calibrate.py
+# (Task 4) and then updated HERE and in the spec table. Never sweep them.
+PARAMS_PROVISIONAL = dict(
+    zone_pivot_k=3, zone_min_touches=2,
+    zone_width_atr15=0.25,          # CALIBRATE
+    zone_expiry_sessions=2, zone_break_atr15=0.25,
+    leg_min_atr15=0.50,             # CALIBRATE
+    leg_timeout_min=60, max_attempts_per_leg=2,
+    impulse_min_atr30=2.0,          # CALIBRATE
+    pullback_min_atr30=1.0,         # CALIBRATE
+    use_engulfing=1, use_hammer=1, use_doji_star=1,
+    entry_offset_ticks=2, entry_ttl_bars=6,
+    stop_buffer_atr30=0.50,         # CALIBRATE
+    target_r=1.5, breakeven_at_r=0.0, be_offset_ticks=4,
+    contracts=1, daily_loss_r=0.0, flatten_hhmm=1558,
+)
 
 # Candle proportions are internal constants, not parameters (dial bloat
 # burned a search ledger before -- see the spec).
@@ -108,9 +145,10 @@ def zones(b15, day15, p):
     #zone_min_touches confirmed; the pivot itself was already confirmed
     zone_pivot_k bars earlier).
     died_i: first 15m bar whose close crosses the far edge by more than
-    zone_break_atr15 * ATR15, or the first bar of the zone_expiry-th session
-    after birth (day15[i] >= day15[born_i] + zone_expiry -- sessions, not
-    bars: the design spec's default is "2 sessions"); 10**9 while alive.
+    zone_break_atr15 * ATR15, or the first bar of the zone_expiry_sessions-th
+    session after birth (day15[i] >= day15[born_i] + zone_expiry_sessions --
+    sessions, not bars: the design spec's default is "2 sessions"); 10**9
+    while alive.
     A new pivot within one band-width of a live zone merges into it (the old
     zone keeps its identity and touch count).
 
@@ -124,7 +162,7 @@ def zones(b15, day15, p):
     min_touches = int(p["zone_min_touches"])
     width_atr = float(p["zone_width_atr15"])
     break_atr = float(p["zone_break_atr15"])
-    expiry = int(p["zone_expiry"])
+    expiry = int(p["zone_expiry_sessions"])
 
     atr15 = wilder_atr(h, l, c, _ZONE_ATR_N15)
     hi_idx, lo_idx = pivots(h, l, k)
@@ -179,6 +217,349 @@ def zones(b15, day15, p):
     return out
 
 
+# ATR period for the 30s side (impulse, pullback, stop buffer). Internal
+# constant for the same reason as _ZONE_ATR_N15: the closed parameter list
+# carries no ATR-period dial.
+_ATR_N30 = 14
+
+# A data-integrity guard, NOT a parameter -- the LatigoBreak rule (engine.py
+# delta 4): a tunable that silently drops trades is a second strategy wearing
+# the first one's name. A stop this wide can only come from a hole in the tape.
+_SANITY_STOP_TICKS = 1200
+
+_EMPTY4 = (np.array([], np.int64), np.array([], np.int8),
+           np.array([]), np.array([]))
+
+
+# --------------------------------------------------------------- rebar
+# Local, numpy-only copies of tape.day_index / sec_of_day / build_bars. The
+# sandbox injects neither, and `episodes` needs 30s AND 15m bars off the same
+# ticks -- the engine hands a strategy exactly one bar size.
+def _day_index(ts):
+    return (ts // _TPS - _NET_EPOCH_S) // 86400
+
+
+def _sec_of_day(ts):
+    return (ts // _TPS - _NET_EPOCH_S) % 86400
+
+
+def _build_bars(tape, secs):
+    """OHLC per (day, time-slot), so no bar spans a session gap."""
+    ts, px = tape["ts"], tape["px"]
+    if not len(ts):
+        z = np.array([])
+        return dict(t=z, o=z, h=z, l=z, c=z, start=np.array([], np.int64),
+                    end=np.array([], np.int64))
+    slot = _day_index(ts) * (86400 // secs + 1) + _sec_of_day(ts) // secs
+    starts = np.concatenate(([0], np.flatnonzero(np.diff(slot)) + 1))
+    ends = np.concatenate((starts[1:], [len(ts)]))
+    return dict(t=ts[starts], o=px[starts], c=px[ends - 1],
+                h=np.maximum.reduceat(px, starts),
+                l=np.minimum.reduceat(px, starts), start=starts, end=ends)
+
+
+def _ep(kind, leg, a15, a30, trig_ts=-1, trig_kind=None, entry_stop=0.0,
+        entry_tick=-1, stop_px=0.0, target_px=0.0):
+    """One episode row. Terminal kinds carry no entry geometry (0.0/-1/None);
+    only "filled" and "expired" do.
+
+    `attempt` is capped at max_attempts_per_leg: a fill can only ever be
+    attempt 1..max (the leg dies the moment the last one is consumed), so the
+    cap binds on terminal rows alone, where it reads as the last attempt used
+    rather than a phantom third one the contract does not allow."""
+    z = leg["z"]
+    return dict(kind=kind, dir=leg["dir"], zone_px=z["px"],
+                zone_touches=z["touches"], leg_arm_ts=leg["arm_ts"],
+                trig_ts=trig_ts, trig_kind=trig_kind,
+                attempt=min(leg["fills"] + 1, leg["max_att"]),
+                entry_stop_px=entry_stop, entry_tick=entry_tick,
+                pull_ext_px=leg["pull"], stop_px=stop_px, target_px=target_px,
+                atr30=a30, atr15=a15)
+
+
+def episodes(tape, p):
+    """The whole state machine, as a research log: every leg the tape armed and
+    what became of it. `entries()` is a filter over this, so a backtest and a
+    dumped corpus can never describe two different strategies.
+
+    One pass over CLOSED 30s bars. Zones come precomputed from 15m bars and are
+    mapped onto 30s indices by CLOSE TIME, so a zone becomes usable at the 30s
+    bar that closes with its confirming 15m bar and not one bar earlier. Ticks
+    are read for one thing only: whether the resting stop entry filled.
+
+    EVERY FIELD OF AN EPISODE IS FROZEN AT THE TRIGGER BAR'S CLOSE -- prices,
+    both ATRs, the pullback extreme. The tick scan afterwards contributes the
+    fill index and nothing else. That is the invariant the truncation selfcheck
+    exists to hold: an earlier study on this same pattern had its entire
+    apparent edge come from reading intrabar order at the fill.
+    """
+    ts, px = tape["ts"], tape["px"]
+    b30 = _build_bars(tape, 30)
+    b15 = _build_bars(tape, 900)
+    n30, n15 = len(b30["c"]), len(b15["c"])
+    if n30 < 2 or n15 < 2:
+        return []
+    zs = zones(b15, _day_index(b15["t"]), p)
+    if not zs:
+        return []
+
+    o30, h30, l30, c30 = b30["o"], b30["h"], b30["l"], b30["c"]
+    atr30 = wilder_atr(h30, l30, c30, _ATR_N30)
+    atr15 = wilder_atr(b15["h"], b15["l"], b15["c"], _ZONE_ATR_N15)
+    tc15, tc30 = ts[b15["end"] - 1], ts[b30["end"] - 1]
+    # The last 15m bar CLOSED at or before this 30s bar's close. Equal times
+    # are the same tick, so the 15m bar that ends there is already closed.
+    j15 = np.searchsorted(tc15, tc30, "right") - 1
+    sod, dayn = _sec_of_day(tc30), _day_index(tc30)
+
+    for z in zs:
+        z["i0"] = int(np.searchsorted(tc30, tc15[z["born_i"]], "left"))
+        z["i1"] = (n30 if z["died_i"] >= n15
+                   else int(np.searchsorted(tc30, tc15[z["died_i"]], "left")))
+        z["touched"] = False
+    zs.sort(key=lambda z: z["i0"])
+
+    hh = int(p["flatten_hhmm"])
+    cutoff = (hh // 100) * 3600 + (hh % 100) * 60
+    ttl = int(p["entry_ttl_bars"])
+    off = int(p["entry_offset_ticks"]) * TICK
+    max_att = int(p["max_attempts_per_leg"])
+    timeout = int(p["leg_timeout_min"] * 60 * _TPS)
+    max_risk = _SANITY_STOP_TICKS * TICK
+
+    out, leg, live, zi = [], None, [], 0
+    for i in range(n30):
+        while zi < len(zs) and zs[zi]["i0"] <= i:
+            live.append(zs[zi])
+            zi += 1
+        if live and any(i >= z["i1"] for z in live):
+            live = [z for z in live if i < z["i1"]]
+        jj = int(j15[i])
+        if jj < 0:
+            continue
+        a15, a30 = float(atr15[jj]), float(atr30[i])
+        if not (a15 > 0 and a30 > 0):
+            continue
+
+        # --- leg death. Gates NEW entries only: a position opened by this leg
+        # outlives it and belongs to its brackets (spec 2, last bullet).
+        if leg is not None:
+            d, z0 = leg["dir"], leg["z"]
+            if leg["fills"] >= max_att:
+                why = "attempts"
+            elif dayn[i] != leg["day"] or sod[i] >= cutoff:
+                why = "session"
+            elif tc30[i] - leg["t0"] >= timeout:
+                why = "timeout"
+            elif abs(c30[i] - z0["px"]) <= z0["half_w"]:
+                why = "reentry"
+            elif any(z is not z0 and d * (z["px"] - z0["px"]) > 0
+                     and (l30[i] <= z["px"] + z["half_w"] if d < 0
+                          else h30[i] >= z["px"] - z["half_w"]) for z in live):
+                why = "destination"
+            else:
+                why = None
+            if why:
+                out.append(_ep("no_attempt_left" if why == "attempts"
+                               else "leg_died", leg, a15, a30))
+                leg = None
+
+        for z in live:
+            if abs(c30[i] - z["px"]) <= z["half_w"]:
+                z["touched"] = True
+
+        # --- leg arming: a touched zone departed from by leg_min_atr15. One
+        # leg at a time, as in NT8 where there is one state machine.
+        if leg is None and sod[i] < cutoff:
+            gap = p["leg_min_atr15"] * a15
+            for z in live:
+                if not z["touched"]:
+                    continue
+                if c30[i] > z["px"] + z["half_w"] + gap:
+                    d = 1
+                elif c30[i] < z["px"] - z["half_w"] - gap:
+                    d = -1
+                else:
+                    continue
+                z["touched"] = False        # this touch is spent on this leg
+                leg = dict(z=z, dir=d, arm_px=float(c30[i]), ext=float(c30[i]),
+                           pull=float(c30[i]), hunt=False, impulse=False,
+                           fills=0, max_att=max_att, block=-1, t0=int(tc30[i]),
+                           arm_ts=int(tc30[i]), day=int(dayn[i]))
+                break
+            continue        # extension is measured FROM the arming point
+
+        if leg is None:
+            continue
+        d = leg["dir"]
+
+        # --- extension and pullback. A bar that makes a new leg extreme
+        # RESETS the pullback and does not also get credited with its own
+        # opposite wick: inside one 30s bar the order of the high and the low
+        # is unknown, and assuming the convenient one is the intrabar
+        # lookahead this project exists to refuse.
+        ext = float(h30[i] if d > 0 else l30[i])
+        if d * (ext - leg["ext"]) > 0:
+            leg["ext"] = leg["pull"] = ext
+            leg["hunt"] = False
+        else:
+            cnt = float(l30[i] if d > 0 else h30[i])
+            if d * (cnt - leg["pull"]) < 0:
+                leg["pull"] = cnt
+        if not leg["impulse"]:
+            leg["impulse"] = (d * (leg["ext"] - leg["arm_px"])
+                              >= p["impulse_min_atr30"] * a30)
+        if leg["impulse"] and not leg["hunt"]:
+            leg["hunt"] = (d * (leg["ext"] - leg["pull"])
+                           >= p["pullback_min_atr30"] * a30)
+        if not leg["hunt"] or i <= leg["block"]:
+            continue                        # one working entry at a time
+
+        # --- trigger. Order is the spec's, and it is the tie-break when one
+        # bar matches two: engulfing, then hammer, then doji.
+        if p["use_engulfing"] and candle_engulfing(o30, h30, l30, c30, i, d):
+            kind = "engulfing"
+        elif p["use_hammer"] and candle_hammer(o30, h30, l30, c30, i, d):
+            kind = "hammer"
+        elif (p["use_doji_star"] and candle_doji(o30, h30, l30, c30, i)
+              and abs((h30[i] if d < 0 else l30[i]) - leg["pull"]) < 1e-9):
+            kind = "doji"                   # ...printed AT the pullback extreme
+        else:
+            continue
+        # No entry whose working window could still be alive at the flatten.
+        if sod[i] + ttl * 30 > cutoff:
+            continue
+
+        entry_stop = float(h30[i] + off if d > 0 else l30[i] - off)
+        stop_px = float(leg["pull"] - d * p["stop_buffer_atr30"] * a30)
+        risk = abs(stop_px - entry_stop)
+        if not 0 < risk <= max_risk:
+            continue
+        target_px = float(entry_stop + d * p["target_r"] * risk)
+
+        hi_i = min(i + ttl, n30 - 1)
+        et = -1
+        if i + 1 <= hi_i:
+            a, b = int(b30["start"][i + 1]), int(b30["end"][hi_i])
+            seg = px[a:b]
+            hit = (np.flatnonzero(seg >= entry_stop - 1e-9) if d > 0
+                   else np.flatnonzero(seg <= entry_stop + 1e-9))
+            if len(hit):
+                et = a + int(hit[0])
+        leg["block"] = i + ttl
+        out.append(_ep("filled" if et >= 0 else "expired", leg, a15, a30,
+                       trig_ts=int(tc30[i]), trig_kind=kind,
+                       entry_stop=entry_stop, entry_tick=et, stop_px=stop_px,
+                       target_px=target_px))
+        if et >= 0:
+            # An attempt is consumed by a FILL, not by a trigger. An unfilled
+            # entry cancels and the hunt continues on the same pullback.
+            leg["fills"] += 1
+            leg["hunt"] = False
+
+    if leg is not None:
+        i = n30 - 1
+        out.append(_ep("no_attempt_left" if leg["fills"] >= max_att
+                       else "leg_died", leg, float(atr15[max(int(j15[i]), 0)]),
+                       float(atr30[i])))
+    return out
+
+
+class PullbackZone(Strategy):
+    """Pullback-continuation off a 15m S/R zone, triggered by a reversal candle
+    and entered on a confirmation stop. Spec:
+    docs/specs/2026-08-05-pullbackzone-design.md.
+
+    PARAMETER NAMES ARE THE NT8 PROPERTY NAMES IN SNAKE_CASE AND THE LIST IS
+    CLOSED, the LatigoBreak rule: an extra dial on one side silently makes the
+    PropSim run and the Market Replay run two different experiments.
+
+    Three engine-side dials are inert here and it is not an oversight:
+    `daily_loss_r` is enforced by NT8 (entry generation is path-independent and
+    cannot know a trade's outcome -- LatigoBreak delta 3), and the engine reads
+    its breakeven offset from `breakeven_offset_ticks`, a name the closed list
+    does not have. Both are 0/off at the frozen defaults; `compare_mirror.py`
+    is what catches them if they ever are not.
+    """
+    name, label = "pullback_zone", "PullbackZone (15m zone -> pullback -> reversal candle)"
+    uses_ticks = True
+    full_session = False                # RTH only, 09:30-16:00 ET
+
+    params = {
+        "zone_pivot_k": Param(3, 1, 10, "swing pivot lookback/forward, 15m bars",
+                              fixed=True),
+        "zone_min_touches": Param(2, 1, 5, "touches before a pivot is a zone",
+                                  fixed=True),
+        # The five CALIBRATE dials are fixed for the same reason a window is:
+        # research/calibrate.py picks them from percentiles of market
+        # behaviour, never from P&L. Sweeping them re-opens that decision with
+        # the one criterion the calibration deliberately refused.
+        "zone_width_atr15": Param(0.25, 0.05, 2.0, "zone half-width, ATR15s",
+                                  fixed=True),
+        "zone_expiry_sessions": Param(2, 1, 20, "sessions a zone survives",
+                                      fixed=True),
+        "zone_break_atr15": Param(0.25, 0.0, 2.0, "close beyond the far edge "
+                                                  "that kills a zone, ATR15s"),
+        "leg_min_atr15": Param(0.50, 0.1, 3.0, "departure from the zone edge "
+                                               "that arms a leg, ATR15s",
+                               fixed=True),
+        "leg_timeout_min": Param(60, 5, 390, "a leg stops arming entries after "
+                                             "this long, minutes", fixed=True),
+        "max_attempts_per_leg": Param(2, 1, 5, "fills allowed per leg",
+                                      fixed=True),
+        "impulse_min_atr30": Param(2.0, 0.5, 8.0, "extension from the arming "
+                                                  "point before a pullback "
+                                                  "counts, ATR30s", fixed=True),
+        "pullback_min_atr30": Param(1.0, 0.2, 5.0, "counter-move from the leg "
+                                                   "extreme that arms the "
+                                                   "hunt, ATR30s", fixed=True),
+        "use_engulfing": Param(1, 0, 1, "engulfing trigger", fixed=True),
+        "use_hammer": Param(1, 0, 1, "hammer / shooting-star trigger", fixed=True),
+        "use_doji_star": Param(1, 0, 1, "doji-star trigger", fixed=True),
+        "entry_offset_ticks": Param(2, 0, 20, "stop entry beyond the trigger "
+                                              "candle's extreme, ticks", fixed=True),
+        "entry_ttl_bars": Param(6, 1, 40, "working life of the entry, 30s bars",
+                                fixed=True),
+        "stop_buffer_atr30": Param(0.50, 0.05, 3.0, "stop beyond the pullback "
+                                                    "extreme, ATR30s", fixed=True),
+        "target_r": Param(1.5, 0.5, 6.0, "target as a multiple of risk"),
+        "breakeven_at_r": Param(0.0, 0.0, 5.0, "move the stop to entry at this "
+                                               "R; 0 = off", fixed=True),
+        "be_offset_ticks": Param(4, 0, 40, "ticks past entry the breakeven stop "
+                                           "sits", fixed=True),
+        "contracts": Param(1, 1, 100, "position size, contracts", fixed=True),
+        "daily_loss_r": Param(0.0, 0.0, 20.0, "stop for the day at this loss, R; "
+                                              "0 = off (NT8 side)", fixed=True),
+        "flatten_hhmm": Param(1558, 0, 2359, "session flatten, ET HHMM",
+                              fixed=True),
+    }
+
+    def risk_ticks(self, p) -> float:
+        return _SANITY_STOP_TICKS
+
+    def entries(self, bars, tape, p):
+        # `bars` is deliberately unused. This setup needs TWO series (30s and
+        # 15m) off the same ticks and the engine builds exactly one, so both
+        # are rebuilt in `episodes`. The consequence is worth knowing before
+        # someone reads a sweep: the engine's --tf changes nothing here.
+        eps = [e for e in episodes(tape, p) if e["kind"] == "filled"]
+        if not eps:
+            return _EMPTY4
+        et = np.array([e["entry_tick"] for e in eps], np.int64)
+        dr = np.array([e["dir"] for e in eps], np.int8)
+        st = np.array([e["stop_px"] for e in eps])
+        tg = np.array([e["target_px"] for e in eps])
+        if p.get("breakeven_at_r", 0) > 0:
+            # The engine's sixth array is a PRICE per trade, not a fraction
+            # (engine.resolve: "the first tick to reach it moves the stop to
+            # the entry fill"). R is measured off the signal's own risk, which
+            # is why it is reconstructed here rather than passed as a ratio.
+            be = np.array([e["entry_stop_px"] + e["dir"] * p["breakeven_at_r"]
+                           * abs(e["stop_px"] - e["entry_stop_px"]) for e in eps])
+            return et, dr, st, tg, None, be
+        return et, dr, st, tg
+
+
 # ---------------------------------------------------------------- selfcheck
 def _selfcheck_candles():
     o = np.array([10.0, 11.0, 10.0, 10.9, 10.0])
@@ -223,26 +604,222 @@ def _selfcheck_zones():
     h[40] = 112.0; l[40] = 111.3; c[40] = 111.9          # close clears the far edge -> dies here
 
     p = dict(zone_pivot_k=2, zone_min_touches=2, zone_width_atr15=0.5,
-              zone_break_atr15=0.25, zone_expiry=100)
+              zone_break_atr15=0.25, zone_expiry_sessions=100)
     z = zones(dict(h=h, l=l, c=c), day, p)
     assert len(z) == 1, f"the 3rd pivot at the same price created a second zone: {z}"
     assert z[0]["born_i"] == 32, z[0]
     assert z[0]["died_i"] == 40, z[0]
     assert z[0]["touches"] == 2, z[0]
 
-    # zone_expiry counts SESSIONS via day15, not bars (spec default "2
-    # sessions"): born on day 0 (bar 32), 3 sessions total, nothing else
+    # zone_expiry_sessions counts SESSIONS via day15, not bars (spec default
+    # "2 sessions"): born on day 0 (bar 32), 3 sessions total, nothing else
     # kills it -- must die at the first bar of day 0 + 2 = day 2, well
     # before the (now moot) clean-break bar at 40 is even reached.
     day3 = np.concatenate([np.zeros(33, int), np.ones(6, int), np.full(6, 2, int)])
-    p3 = dict(p, zone_expiry=2)
+    p3 = dict(p, zone_expiry_sessions=2)
     z3 = zones(dict(h=h, l=l, c=c), day3, p3)
     assert z3[0]["born_i"] == 32, z3[0]
     assert z3[0]["died_i"] == 39, z3[0]                 # first bar of day 2
     print("zones OK")
 
 
+def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False):
+    """The 30s bar path of the episode fixture: one RTH session containing a
+    15m pivot high at exactly 110.0, two touches, a short leg, an impulse, a
+    pullback, a shooting star and a fill.
+
+    Blocks 0..16 are exactly 30 bars each, so a block index IS a 15m bar
+    index; after the zone is born the layout stops caring.
+    """
+    b = []
+
+    def q(x):
+        return round(x / TICK) * TICK
+
+    def one(o, h, l, c):
+        b.append((q(o), q(h), q(l), q(c)))
+
+    def flat(n, px, w=0.5):
+        for _ in range(n):
+            one(px, px + w, px - w, px)
+
+    def ramp(n, a, z, w=0.25):
+        for k in range(n):
+            o = a + (z - a) * k / n
+            c = a + (z - a) * (k + 1) / n
+            one(o, max(o, c) + w, min(o, c) - w, c)
+
+    for _ in range(6):                      # 0-5   flat warmup, seeds ATR15
+        flat(30, 100.0)
+    ramp(30, 100.0, 108.0)                  # 6     approach
+    ramp(15, 108.0, 109.75)                 # 7     PIVOT HIGH: highs top at
+    ramp(15, 109.75, 107.5)                 #       exactly 110.00 (w=0.25)
+    for _ in range(3):                      # 8-10  bar 10 reveals the pivot
+        flat(30, 107.0)
+    ramp(15, 107.0, 109.75)                 # 11    TOUCH 1: wick to 110,
+    ramp(15, 109.75, 106.5)                 #       close back below
+    for _ in range(2):                      # 12-13
+        flat(30, 106.5)
+    if touch2:                              # 14    TOUCH 2 -> zone born
+        ramp(15, 106.5, 109.75)
+        ramp(15, 109.75, 106.5)
+    else:
+        flat(30, 106.5)
+    ramp(10, 106.5, 109.75)                 # 15    retest AFTER birth: one 30s
+    one(109.75, 110.0, 109.75, 110.0)       #       bar CLOSES at 110 (in band)
+    if fast_depart:
+        # One bar straight through the departure threshold, so the leg ARMS at
+        # its own extreme and there is no impulse left to make. The marking
+        # time afterwards keeps a REAL range: wickless bars have a TrueRange of
+        # zero, which decays ATR30s toward nothing and drags the impulse
+        # threshold down under even a 0.25-point "impulse".
+        one(110.0, 110.0, 104.0, 104.0)     # 15
+        flat(18, 104.0, w=0.25)
+        flat(30, 104.0, w=0.25)             # 16    stands in for the impulse
+    else:
+        ramp(19, 110.0, 104.0)              # 15    departs -> leg arms
+        # Wickless: a wick on a descending bar reaches back above the running
+        # low, and at the PROVISIONAL pullback_min (1.0 x ATR30s, which the
+        # spec itself says is about one bar's range and is what calibration
+        # exists to fix) that is enough to arm the hunt mid-impulse.
+        ramp(30, 104.0, leg_low, w=0.0)     # 16    impulse
+    lvl = leg_low                           # 17+   pullback: bullish bars, no
+    for _ in range(4):                      #       candle pattern can fire on
+        one(lvl, lvl + 0.75, lvl - 0.25, lvl + 0.5)     # a bullish body of 0.5
+        lvl += 0.5
+    one(lvl, lvl + 1.0, lvl - 0.25, lvl + 0.5)          # pullback extreme
+    one(lvl - 0.5, lvl + 1.0, lvl - 1.25, lvl - 1.0)    # SHOOTING STAR (trigger)
+    # The fill is this bar's OPENING print (the entry stop sits at 99.25 and
+    # the market runs through it). That is what gives the truncation assert its
+    # teeth: cutting the tape one tick later leaves this bar half-formed, so
+    # any field read from the bar the fill lands in changes and the assert
+    # fires. Fill on a bar's third print and the cut lands past its close,
+    # which is a check that cannot fail.
+    one(lvl - 2.0, lvl - 1.75, lvl - 2.5, lvl - 2.25)   # fill bar: fills at once
+    ramp(20, lvl - 2.25, lvl - 5.0, w=0.0)  # continuation, no second setup
+    return b
+
+
+def _fx_tape(bars30, sod0=9 * 3600 + 30 * 60, day0=20000):
+    """Four prints per 30s bar -- open, both extremes in path order, close."""
+    ts, px = [], []
+    base = (int(day0) * 86400 + _NET_EPOCH_S + int(sod0)) * _TPS
+    for k, (o, h, l, c) in enumerate(bars30):
+        t0 = base + k * 30 * _TPS
+        mid = (h, l) if c < o else (l, h)
+        for dt, v in zip((0, 7, 14, 21), (o, mid[0], mid[1], c)):
+            ts.append(t0 + dt * _TPS)
+            px.append(v)
+    n = len(ts)
+    return dict(ts=np.array(ts, np.int64), px=np.array(px, np.float64),
+                vol=np.ones(n, np.int64), side=np.zeros(n, np.int8))
+
+
+def _selfcheck_episodes():
+    t = _fx_tape(_fx_bars())
+    eps = episodes(t, PARAMS_PROVISIONAL)
+    filled = [e for e in eps if e["kind"] == "filled"]
+    assert len(filled) == 1, [e["kind"] for e in eps]
+    e = filled[0]
+    assert e["dir"] == -1 and e["trig_kind"] == "hammer", e
+    assert abs(e["zone_px"] - 110.0) < 1e-6 and e["attempt"] == 1, e
+    assert e["stop_px"] > e["entry_stop_px"] > e["target_px"], e
+    # stop = pullback extreme + buffer:
+    assert abs(e["stop_px"] - (e["pull_ext_px"]
+                               + PARAMS_PROVISIONAL["stop_buffer_atr30"]
+                               * e["atr30"])) < 1e-6, e
+    # no-lookahead invariant (the 10f discipline): truncate the tape one tick
+    # after the fill -> same stop/target on the filled episode. It BITES:
+    # every field above is frozen at the trigger bar's close, so anything
+    # reading the bar the fill lands in (a forming-bar ATR, a pullback extreme
+    # extended past the trigger) changes here and nowhere else.
+    t2 = {k: v[: e["entry_tick"] + 2] for k, v in t.items()}
+    e2 = [x for x in episodes(t2, PARAMS_PROVISIONAL) if x["kind"] == "filled"][0]
+    assert (e2["stop_px"], e2["target_px"]) == (e["stop_px"], e["target_px"])
+    print("episodes OK")
+
+
+def _selfcheck_episodes_negative():
+    """Three mutations of the fixture, each isolating one gate. Every one of
+    them pairs "nothing fired" with a control that fires, because a check that
+    only ever asserts an empty list passes just as happily when the fixture
+    stopped producing a setup at all."""
+    p = PARAMS_PROVISIONAL
+
+    # (a) no second touch -> the pivot never becomes a zone, so nothing arms.
+    # The retest in block 15 does supply a second 15m touch, but it lands in
+    # the same bar the zone is born in and a zone is only touchable from its
+    # birth bar on -- so no 30s close is ever inside the band.
+    assert episodes(_fx_tape(_fx_bars(touch2=False)), p) == []
+
+    # (b) the leg arms at its own extreme -> the impulse gate refuses it. The
+    # leg is there (it died, so it lived), and dropping ONLY impulse_min_atr30
+    # brings the very same trigger back, which is what makes this a test of the
+    # impulse gate rather than of the fixture.
+    eps = episodes(_fx_tape(_fx_bars(leg_low=104.0, fast_depart=True)), p)
+    assert [e for e in eps if e["kind"] == "leg_died"], eps
+    assert not [e for e in eps if e["kind"] in ("filled", "expired")], eps
+    loose = dict(p, impulse_min_atr30=0.05)
+    assert [e for e in episodes(_fx_tape(_fx_bars(leg_low=104.0,
+                                                  fast_depart=True)), loose)
+            if e["kind"] == "filled"]
+
+    # (c) the same session shifted so the trigger lands past flatten_hhmm. The
+    # shift is a whole number of 15m bars -- shift by anything else and the 15m
+    # grid moves under the fixture, which is a different tape, not a later one.
+    base = _fx_bars()
+    e = [x for x in episodes(_fx_tape(base), p) if x["kind"] == "filled"][0]
+    trig_sod = int(_sec_of_day(np.array([e["trig_ts"]], np.int64))[0])
+    hh = int(p["flatten_hhmm"])
+    cutoff = (hh // 100) * 3600 + (hh % 100) * 60
+    late = _fx_tape(base, sod0=9 * 3600 + 30 * 60
+                    + 900 * ((cutoff - trig_sod) // 900 + 2))
+    assert not [x for x in episodes(late, p) if x["kind"] == "filled"]
+    # ...and it is the flatten that refused it, not the tape: same ticks, one
+    # parameter moved.
+    assert [x for x in episodes(late, dict(p, flatten_hhmm=2359))
+            if x["kind"] == "filled"]
+    print("episodes (negative) OK")
+
+
+def _selfcheck_strategy():
+    """The engine's contract, checked here rather than discovered by
+    plugins.check_output on a real tape."""
+    s = PullbackZone()
+    assert s.risk_ticks(PARAMS_PROVISIONAL) == _SANITY_STOP_TICKS
+    for k in s.params:                      # the closed list, both directions
+        assert k in PARAMS_PROVISIONAL, k
+    for k, v in PARAMS_PROVISIONAL.items():
+        assert k in s.params, k
+        assert s.params[k].lo <= v <= s.params[k].hi, k
+        assert s.params[k].default == v, k
+
+    t = _fx_tape(_fx_bars())
+    res = s.entries(None, t, PARAMS_PROVISIONAL)
+    assert len(res) == 4
+    et, dr, st, tg = res
+    assert et.dtype == np.int64 and dr.dtype == np.int8
+    assert len(et) == len(dr) == len(st) == len(tg) == 1
+    assert 0 <= et[0] < len(t["ts"])
+    fill = t["px"][et[0]]                   # a short's stop sits ABOVE its fill
+    assert st[0] > fill > tg[0], (st[0], fill, tg[0])
+
+    # Breakeven returns the engine's 6-tuple, and the sixth array is a PRICE
+    # between the entry and the target -- not a fraction.
+    et2, dr2, st2, tg2, lim, be = s.entries(None, t, dict(PARAMS_PROVISIONAL,
+                                                          breakeven_at_r=1.0))
+    assert lim is None and len(be) == len(et2)
+    ep = [x for x in episodes(t, PARAMS_PROVISIONAL) if x["kind"] == "filled"][0]
+    risk = abs(ep["stop_px"] - ep["entry_stop_px"])
+    assert abs(be[0] - (ep["entry_stop_px"] - 1.0 * risk)) < 1e-9, be[0]
+    assert tg2[0] < be[0] < st2[0], be[0]
+    print("strategy OK")
+
+
 if __name__ == "__main__":
     _selfcheck_candles()
     _selfcheck_atr_pivots()
     _selfcheck_zones()
+    _selfcheck_episodes()
+    _selfcheck_episodes_negative()
+    _selfcheck_strategy()
