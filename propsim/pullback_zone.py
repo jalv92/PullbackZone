@@ -3,7 +3,12 @@
 
 Spec: docs/specs/2026-08-05-pullbackzone-design.md. Parameter list is CLOSED
 and mirrors ninjascript/PullbackZoneStrategy.cs one-to-one.
-Sandbox rule: imports limited to math/numpy so plugins.py --check passes.
+
+Sandbox: the loader injects `np` and `tp` (and Strategy/Param) rather than
+letting a plugin import anything, so the numpy import below is PENDING a
+PropSim allowlist change (Task 3) and is currently the one thing failing
+`plugins.py --check`. It exists so this file runs its own selfchecks
+standalone.
 """
 import numpy as np
 
@@ -327,13 +332,21 @@ def episodes(tape, p):
     timeout = int(p["leg_timeout_min"] * 60 * _TPS)
     max_risk = _SANITY_STOP_TICKS * TICK
 
-    out, leg, live, zi = [], None, [], 0
+    out, leg, live, zi, prev_day = [], None, [], 0, -1
     for i in range(n30):
         while zi < len(zs) and zs[zi]["i0"] <= i:
             live.append(zs[zi])
             zi += 1
         if live and any(i >= z["i1"] for z in live):
             live = [z for z in live if i < z["i1"]]
+        # A touch does not survive the overnight gap. A zone outlives the
+        # session (zone_expiry_sessions defaults to 2) but "price touched this
+        # and then left" is an intraday observation -- carrying it across the
+        # break would arm a leg on yesterday's touch and this morning's open.
+        if dayn[i] != prev_day:
+            prev_day = int(dayn[i])
+            for z in zs:
+                z["touched"] = False
         jj = int(j15[i])
         if jj < 0:
             continue
@@ -437,10 +450,15 @@ def episodes(tape, p):
             continue
         target_px = float(entry_stop + d * p["target_r"] * risk)
 
-        hi_i = min(i + ttl, n30 - 1)
+        # The entry works for entry_ttl_bars of WALL CLOCK, not that many bar
+        # slots. Bar i+6 can be an hour later across a hole in the tape -- the
+        # engine documents a 3,538-second jump on 2026-07-17 -- and an order
+        # left working across one is not the order NT8 would have had.
+        t_trig = int(tc30[i])
+        a = int(np.searchsorted(ts, t_trig, "right"))
+        b = int(np.searchsorted(ts, t_trig + ttl * 30 * _TPS, "right"))
         et = -1
-        if i + 1 <= hi_i:
-            a, b = int(b30["start"][i + 1]), int(b30["end"][hi_i])
+        if b > a:
             seg = px[a:b]
             hit = (np.flatnonzero(seg >= entry_stop - 1e-9) if d > 0
                    else np.flatnonzero(seg <= entry_stop + 1e-9))
@@ -452,10 +470,36 @@ def episodes(tape, p):
                        entry_stop=entry_stop, entry_tick=et, stop_px=stop_px,
                        target_px=target_px))
         if et >= 0:
-            # An attempt is consumed by a FILL, not by a trigger. An unfilled
-            # entry cancels and the hunt continues on the same pullback.
+            # An attempt is consumed by a FILL, not by a trigger -- and spec 7
+            # grants the second one only "if the first fill STOPS OUT". So
+            # resolve this fill against the tape, pessimistically (a tie goes
+            # to the stop), and gate the leg on the answer:
+            #   stopped out -> hunting resumes at the next bar to CLOSE after
+            #                  the stop print, and a fresh trigger is required;
+            #   target, or neither inside the leg's own lifetime -> no further
+            #                  attempt on this leg, ever.
+            # `block` carries both cases because it already means "no trigger
+            # at or before this bar" -- which is what makes the gate real. The
+            # `hunt = False` that used to sit here was a no-op: the pullback
+            # conditions still held, so the next bar re-armed it immediately.
+            #
+            # Not lookahead: re-arming at bar `rearm` reads only prints that
+            # had already printed when that bar closed.
             leg["fills"] += 1
-            leg["hunt"] = False
+            end_ts = min(leg["t0"] + timeout,
+                         (leg["day"] * 86400 + _NET_EPOCH_S + cutoff) * _TPS)
+            seg2 = px[et + 1:int(np.searchsorted(ts, end_ts, "right"))]
+            if d > 0:
+                s_hit = np.flatnonzero(seg2 <= stop_px + 1e-9)
+                t_hit = np.flatnonzero(seg2 >= target_px - 1e-9)
+            else:
+                s_hit = np.flatnonzero(seg2 >= stop_px - 1e-9)
+                t_hit = np.flatnonzero(seg2 <= target_px + 1e-9)
+            if len(s_hit) and (not len(t_hit) or s_hit[0] <= t_hit[0]):
+                leg["block"] = int(np.searchsorted(
+                    tc30, ts[et + 1 + int(s_hit[0])], "right")) - 1
+            else:
+                leg["block"] = n30
 
     if leg is not None:
         i = n30 - 1
@@ -474,12 +518,14 @@ class PullbackZone(Strategy):
     CLOSED, the LatigoBreak rule: an extra dial on one side silently makes the
     PropSim run and the Market Replay run two different experiments.
 
-    Three engine-side dials are inert here and it is not an oversight:
-    `daily_loss_r` is enforced by NT8 (entry generation is path-independent and
-    cannot know a trade's outcome -- LatigoBreak delta 3), and the engine reads
-    its breakeven offset from `breakeven_offset_ticks`, a name the closed list
-    does not have. Both are 0/off at the frozen defaults; `compare_mirror.py`
-    is what catches them if they ever are not.
+    `daily_loss_r` is inert here and it is not an oversight: NT8 enforces it,
+    while entry generation is path-independent and cannot know a trade's
+    outcome (LatigoBreak delta 3). It is 0/off at the frozen defaults;
+    `compare_mirror.py` is what catches it if it ever is not.
+
+    `be_offset_ticks` is the one public name for the breakeven offset, but
+    `engine.backtest` reads `breakeven_offset_ticks` (engine.py:1242), so
+    `entries` aliases it across rather than growing a second dial.
     """
     name, label = "pullback_zone", "PullbackZone (15m zone -> pullback -> reversal candle)"
     uses_ticks = True
@@ -542,6 +588,10 @@ class PullbackZone(Strategy):
         # 15m) off the same ticks and the engine builds exactly one, so both
         # are rebuilt in `episodes`. The consequence is worth knowing before
         # someone reads a sweep: the engine's --tf changes nothing here.
+        #
+        # The engine reads its breakeven offset under a name the closed list
+        # does not carry; this is the only place to hand it over.
+        p["breakeven_offset_ticks"] = p["be_offset_ticks"]
         eps = [e for e in episodes(tape, p) if e["kind"] == "filled"]
         if not eps:
             return _EMPTY4
@@ -623,13 +673,19 @@ def _selfcheck_zones():
     print("zones OK")
 
 
-def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False):
+def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False, after="continue"):
     """The 30s bar path of the episode fixture: one RTH session containing a
     15m pivot high at exactly 110.0, two touches, a short leg, an impulse, a
     pullback, a shooting star and a fill.
 
     Blocks 0..16 are exactly 30 bars each, so a block index IS a 15m bar
     index; after the zone is born the layout stops caring.
+
+    `after` picks what happens once attempt 1 has filled: "continue" runs the
+    trade down and offers no second setup, "stopout" walks price back through
+    attempt 1's stop and then offers a fresh trigger, "target" reaches attempt
+    1's target first and then offers the same fresh trigger. The last two are
+    the spec-7 gate: only "stopout" may produce an attempt 2.
     """
     b = []
 
@@ -648,6 +704,29 @@ def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False):
             o = a + (z - a) * k / n
             c = a + (z - a) * (k + 1) / n
             one(o, max(o, c) + w, min(o, c) - w, c)
+
+    def rise(a, z):
+        """Bullish bars of body 0.5. No candle predicate can fire on one, so a
+        pullback can be walked up without tripping a trigger."""
+        x = a
+        while x < z - 1e-9:
+            one(x, x + 0.75, x - 0.25, x + 0.5)
+            x += 0.5
+        return x
+
+    def star(top, fill=True):
+        """A shooting star topping at `top`, preceded by a bullish bar whose
+        body is as large (so engulfing cannot claim the star first), and
+        optionally the bar that fills the entry stop on its OPENING print."""
+        one(top - 1.0, top, top - 1.25, top - 0.5)
+        one(top - 1.5, top, top - 2.25, top - 2.0)
+        if fill:
+            # The fill being the opening print is what gives the truncation
+            # assert its teeth: cutting the tape one tick later leaves this bar
+            # half-formed, so any field read from the bar the fill lands in
+            # changes. Fill on a bar's third print and the cut lands past its
+            # close, which is a check that cannot fail.
+            one(top - 3.0, top - 2.75, top - 3.5, top - 3.25)
 
     for _ in range(6):                      # 0-5   flat warmup, seeds ATR15
         flat(30, 100.0)
@@ -683,29 +762,38 @@ def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False):
         # spec itself says is about one bar's range and is what calibration
         # exists to fix) that is enough to arm the hunt mid-impulse.
         ramp(30, 104.0, leg_low, w=0.0)     # 16    impulse
-    lvl = leg_low                           # 17+   pullback: bullish bars, no
-    for _ in range(4):                      #       candle pattern can fire on
-        one(lvl, lvl + 0.75, lvl - 0.25, lvl + 0.5)     # a bullish body of 0.5
-        lvl += 0.5
-    one(lvl, lvl + 1.0, lvl - 0.25, lvl + 0.5)          # pullback extreme
-    one(lvl - 0.5, lvl + 1.0, lvl - 1.25, lvl - 1.0)    # SHOOTING STAR (trigger)
-    # The fill is this bar's OPENING print (the entry stop sits at 99.25 and
-    # the market runs through it). That is what gives the truncation assert its
-    # teeth: cutting the tape one tick later leaves this bar half-formed, so
-    # any field read from the bar the fill lands in changes and the assert
-    # fires. Fill on a bar's third print and the cut lands past its close,
-    # which is a check that cannot fail.
-    one(lvl - 2.0, lvl - 1.75, lvl - 2.5, lvl - 2.25)   # fill bar: fills at once
-    ramp(20, lvl - 2.25, lvl - 5.0, w=0.0)  # continuation, no second setup
+    lvl = rise(leg_low, leg_low + 2.0)      # 17+   pullback
+    star(lvl + 1.0)                         # ATTEMPT 1: trigger + fill
+    bot = lvl - 2.25                        # the fill bar's close
+
+    if after == "continue":
+        ramp(20, bot, lvl - 5.0, w=0.0)     # runs on down, no second setup
+    elif after == "stopout":
+        # Back up through attempt 1's stop (pull extreme 102.00 + half an
+        # ATR30s, so ~102.3), but NOT before offering a trigger-shaped candle
+        # that the gate must ignore because the stop has not been hit yet.
+        star(rise(bot, lvl - 0.25) + 1.0, fill=False)    # tops ~101.75: IGNORED
+        star(rise(lvl - 1.25, lvl + 3.0) + 1.0)          # tops ~105: ATTEMPT 2
+    elif after == "target":
+        # Attempt 1's target (~94.7) comes first, so the identical trigger
+        # below must produce nothing at all.
+        ramp(12, bot, lvl - 8.0, w=0.0)
+        star(rise(lvl - 8.0, lvl - 4.0) + 1.0)
     return b
 
 
-def _fx_tape(bars30, sod0=9 * 3600 + 30 * 60, day0=20000):
-    """Four prints per 30s bar -- open, both extremes in path order, close."""
+def _fx_tape(bars30, sod0=9 * 3600 + 30 * 60, day0=20000, split_at=None):
+    """Four prints per 30s bar -- open, both extremes in path order, close.
+
+    `split_at` restarts the clock on the NEXT session at that bar index, which
+    is how a fixture puts a zone touch and the departure from it on opposite
+    sides of an overnight gap."""
     ts, px = [], []
     base = (int(day0) * 86400 + _NET_EPOCH_S + int(sod0)) * _TPS
+    nxt = base + 86400 * _TPS
     for k, (o, h, l, c) in enumerate(bars30):
-        t0 = base + k * 30 * _TPS
+        t0 = (base + k * 30 * _TPS if split_at is None or k < split_at
+              else nxt + (k - split_at) * 30 * _TPS)
         mid = (h, l) if c < o else (l, h)
         for dt, v in zip((0, 7, 14, 21), (o, mid[0], mid[1], c)):
             ts.append(t0 + dt * _TPS)
@@ -779,7 +867,58 @@ def _selfcheck_episodes_negative():
     # parameter moved.
     assert [x for x in episodes(late, dict(p, flatten_hhmm=2359))
             if x["kind"] == "filled"]
+
+    # (d) a touch does not cross the overnight gap. Split the session between
+    # the retest and the departure: same bars, same order, no leg.
+    bars = _fx_bars()
+    assert episodes(_fx_tape(bars, split_at=463), p) == []
+    assert [x for x in episodes(_fx_tape(bars), p) if x["kind"] == "filled"]
     print("episodes (negative) OK")
+
+
+def _selfcheck_attempt_gate():
+    """Spec 7: the second attempt exists only if the first fill STOPS OUT."""
+    p = PARAMS_PROVISIONAL
+
+    t = _fx_tape(_fx_bars(after="stopout"))
+    eps = episodes(t, p)
+    a1 = [e for e in eps if e["kind"] == "filled" and e["attempt"] == 1]
+    a2 = [e for e in eps if e["kind"] == "filled" and e["attempt"] == 2]
+    assert len(a1) == 1 and len(a2) == 1, [(e["kind"], e["attempt"]) for e in eps]
+    # The trigger-shaped candle printed BEFORE the stop-out produced nothing:
+    # two entry rows in total, not three.
+    assert len([e for e in eps if e["kind"] in ("filled", "expired")]) == 2, eps
+    seg = t["px"][a1[0]["entry_tick"] + 1:]
+    k = int(np.flatnonzero(seg >= a1[0]["stop_px"] - 1e-9)[0])
+    stop_ts = int(t["ts"][a1[0]["entry_tick"] + 1 + k])
+    assert a2[0]["trig_ts"] > stop_ts, (a2[0]["trig_ts"], stop_ts)
+    # ...and the leg then dies of exhausted attempts, not of anything else.
+    assert [e for e in eps if e["kind"] == "no_attempt_left"], eps
+
+    # Target first -> no attempt 2, despite an identical trigger-shaped candle.
+    eps = episodes(_fx_tape(_fx_bars(after="target")), p)
+    assert len([e for e in eps if e["kind"] == "filled"]) == 1, eps
+    assert not [e for e in eps if e["attempt"] == 2
+                and e["kind"] in ("filled", "expired")], eps
+    print("attempt gate OK")
+
+
+def _selfcheck_ttl_wall_clock():
+    """entry_ttl_bars is wall clock: a hole in the tape must expire the entry,
+    not carry it to whatever bar index happens to be six slots later."""
+    p = PARAMS_PROVISIONAL
+    bars = _fx_bars()
+    t = _fx_tape(bars)
+    e = [x for x in episodes(t, p) if x["kind"] == "filled"][0]
+    # Open an hour-wide hole immediately before the fill. Same prints, same
+    # prices, same bar ORDER -- only the clock moves, so an entry bounded by
+    # bar indices still fills and one bounded by wall clock cannot.
+    hole = dict(t)
+    hole["ts"] = t["ts"].copy()
+    hole["ts"][e["entry_tick"]:] += 3600 * _TPS
+    got = [x for x in episodes(hole, p) if x["trig_ts"] == e["trig_ts"]]
+    assert got and got[0]["kind"] == "expired", got
+    print("ttl wall clock OK")
 
 
 def _selfcheck_strategy():
@@ -794,8 +933,15 @@ def _selfcheck_strategy():
         assert s.params[k].lo <= v <= s.params[k].hi, k
         assert s.params[k].default == v, k
 
+    # A COPY: entries() writes the breakeven-offset alias into the dict it is
+    # handed (the only channel the engine reads it on), and PARAMS_PROVISIONAL
+    # is the module's source of truth for the closed list -- letting a run
+    # grow a key in it would make the round-trip above pass or fail depending
+    # on what ran first.
     t = _fx_tape(_fx_bars())
-    res = s.entries(None, t, PARAMS_PROVISIONAL)
+    pp = dict(PARAMS_PROVISIONAL)
+    res = s.entries(None, t, pp)
+    assert pp["breakeven_offset_ticks"] == pp["be_offset_ticks"]
     assert len(res) == 4
     et, dr, st, tg = res
     assert et.dtype == np.int64 and dr.dtype == np.int8
@@ -822,4 +968,6 @@ if __name__ == "__main__":
     _selfcheck_zones()
     _selfcheck_episodes()
     _selfcheck_episodes_negative()
+    _selfcheck_attempt_gate()
+    _selfcheck_ttl_wall_clock()
     _selfcheck_strategy()
