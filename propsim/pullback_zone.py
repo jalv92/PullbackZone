@@ -282,6 +282,29 @@ def _ep(kind, leg, a15, a30, trig_ts=-1, trig_kind=None, entry_stop=0.0,
                 atr30=a30, atr15=a15)
 
 
+def _resolve_exit(ts, px, et, d, stop_px, target_px, flat_ts):
+    """When does this fill's position go flat, and did it go flat at its stop?
+
+    Pessimistic, as everywhere else: a tie goes to the stop. Bounded by the
+    SESSION FLATTEN rather than by the leg's timeout, because a position
+    outlives the leg that opened it and is managed by its brackets and the
+    flatten backstop alone (spec 2, last bullet).
+    """
+    seg = px[et + 1:int(np.searchsorted(ts, flat_ts, "right"))]
+    if d > 0:
+        s = np.flatnonzero(seg <= stop_px + 1e-9)
+        t = np.flatnonzero(seg >= target_px - 1e-9)
+    else:
+        s = np.flatnonzero(seg >= stop_px - 1e-9)
+        t = np.flatnonzero(seg <= target_px + 1e-9)
+    si = int(s[0]) if len(s) else len(seg)
+    ti = int(t[0]) if len(t) else len(seg)
+    k = min(si, ti)
+    if k == len(seg):
+        return int(flat_ts), False          # neither bracket: flattened
+    return int(ts[et + 1 + k]), si == k
+
+
 def episodes(tape, p):
     """The whole state machine, as a research log: every leg the tape armed and
     what became of it. `entries()` is a filter over this, so a backtest and a
@@ -332,7 +355,9 @@ def episodes(tape, p):
     timeout = int(p["leg_timeout_min"] * 60 * _TPS)
     max_risk = _SANITY_STOP_TICKS * TICK
 
-    out, leg, live, zi, prev_day = [], None, [], 0, -1
+    # `busy`: the timestamp this strategy is next flat at. Global, across all
+    # legs -- see the flat-to-flat note at the trigger.
+    out, leg, live, zi, prev_day, busy = [], None, [], 0, -1, -1
     for i in range(n30):
         while zi < len(zs) and zs[zi]["i0"] <= i:
             live.append(zs[zi])
@@ -442,6 +467,17 @@ def episodes(tape, p):
         # No entry whose working window could still be alive at the flatten.
         if sod[i] + ttl * 30 > cutoff:
             continue
+        # FLAT TO FLAT, GLOBALLY: while any earlier fill's position is still
+        # unresolved, or an entry order is still working, no leg may generate
+        # an entry -- not even a different leg at a different zone. The engine
+        # drops overlaps silently (resolve's `free_at`), which would make the
+        # episode log and the backtest two different strategies; NT8 would be
+        # worse still, where an opposite-direction Enter* while in position
+        # REVERSES. Suppressed triggers get no episode row, same as the
+        # flatten-window and sanity-guard skips above.
+        t_trig = int(tc30[i])
+        if t_trig < busy:
+            continue
 
         entry_stop = float(h30[i] + off if d > 0 else l30[i] - off)
         stop_px = float(leg["pull"] - d * p["stop_buffer_atr30"] * a30)
@@ -454,9 +490,9 @@ def episodes(tape, p):
         # slots. Bar i+6 can be an hour later across a hole in the tape -- the
         # engine documents a 3,538-second jump on 2026-07-17 -- and an order
         # left working across one is not the order NT8 would have had.
-        t_trig = int(tc30[i])
+        t_ttl = t_trig + ttl * 30 * _TPS
         a = int(np.searchsorted(ts, t_trig, "right"))
-        b = int(np.searchsorted(ts, t_trig + ttl * 30 * _TPS, "right"))
+        b = int(np.searchsorted(ts, t_ttl, "right"))
         et = -1
         if b > a:
             seg = px[a:b]
@@ -464,42 +500,38 @@ def episodes(tape, p):
                    else np.flatnonzero(seg <= entry_stop + 1e-9))
             if len(hit):
                 et = a + int(hit[0])
-        leg["block"] = i + ttl
         out.append(_ep("filled" if et >= 0 else "expired", leg, a15, a30,
-                       trig_ts=int(tc30[i]), trig_kind=kind,
+                       trig_ts=t_trig, trig_kind=kind,
                        entry_stop=entry_stop, entry_tick=et, stop_px=stop_px,
                        target_px=target_px))
-        if et >= 0:
-            # An attempt is consumed by a FILL, not by a trigger -- and spec 7
-            # grants the second one only "if the first fill STOPS OUT". So
-            # resolve this fill against the tape, pessimistically (a tie goes
-            # to the stop), and gate the leg on the answer:
-            #   stopped out -> hunting resumes at the next bar to CLOSE after
-            #                  the stop print, and a fresh trigger is required;
-            #   target, or neither inside the leg's own lifetime -> no further
-            #                  attempt on this leg, ever.
-            # `block` carries both cases because it already means "no trigger
-            # at or before this bar" -- which is what makes the gate real. The
-            # `hunt = False` that used to sit here was a no-op: the pullback
-            # conditions still held, so the next bar re-armed it immediately.
-            #
-            # Not lookahead: re-arming at bar `rearm` reads only prints that
-            # had already printed when that bar closed.
-            leg["fills"] += 1
-            end_ts = min(leg["t0"] + timeout,
-                         (leg["day"] * 86400 + _NET_EPOCH_S + cutoff) * _TPS)
-            seg2 = px[et + 1:int(np.searchsorted(ts, end_ts, "right"))]
-            if d > 0:
-                s_hit = np.flatnonzero(seg2 <= stop_px + 1e-9)
-                t_hit = np.flatnonzero(seg2 >= target_px - 1e-9)
-            else:
-                s_hit = np.flatnonzero(seg2 >= stop_px - 1e-9)
-                t_hit = np.flatnonzero(seg2 <= target_px + 1e-9)
-            if len(s_hit) and (not len(t_hit) or s_hit[0] <= t_hit[0]):
-                leg["block"] = int(np.searchsorted(
-                    tc30, ts[et + 1 + int(s_hit[0])], "right")) - 1
-            else:
-                leg["block"] = n30
+        if et < 0:
+            busy = t_ttl               # the order worked its whole life
+            continue
+        # An attempt is consumed by a FILL, not by a trigger -- and spec 7
+        # grants the second one only "if the first fill STOPS OUT". The same
+        # resolution answers both questions, so it is done once: when did this
+        # position close, and did it close at its stop?
+        #
+        #   busy until the exit  -> nobody enters while it is open (above);
+        #   stopped out          -> THIS leg may hunt again from the next bar
+        #                           to CLOSE after the stop print, with a fresh
+        #                           trigger candle;
+        #   target or flatten    -> no further attempt on this leg, ever.
+        #
+        # `block` carries the per-leg half because it already means "no trigger
+        # at or before this bar" -- which is what makes the gate real. The
+        # `hunt = False` that used to sit here was a no-op: the pullback
+        # conditions still held, so the next bar re-armed it immediately.
+        #
+        # Not lookahead: re-arming at bar `rearm` reads only prints that had
+        # already printed when that bar closed.
+        leg["fills"] += 1
+        exit_ts, stopped = _resolve_exit(
+            ts, px, et, d, stop_px, target_px,
+            (leg["day"] * 86400 + _NET_EPOCH_S + cutoff) * _TPS)
+        busy = exit_ts
+        leg["block"] = (int(np.searchsorted(tc30, exit_ts, "right")) - 1
+                        if stopped else n30)
 
     if leg is not None:
         i = n30 - 1
@@ -728,6 +760,15 @@ def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False, after="continue"):
             # close, which is a check that cannot fail.
             one(top - 3.0, top - 2.75, top - 3.5, top - 3.25)
 
+    def hammer(bot, fill=True):
+        """`star` mirrored: a hammer bottoming at `bot` for a LONG leg. Keep
+        `bot + 2.25` under the leg's running high, or the hammer sets a new leg
+        extreme and resets the very pullback it is supposed to end."""
+        one(bot + 1.0, bot + 1.25, bot, bot + 0.5)
+        one(bot + 1.5, bot + 2.25, bot, bot + 2.0)
+        if fill:
+            one(bot + 3.0, bot + 3.5, bot + 2.75, bot + 3.25)
+
     for _ in range(6):                      # 0-5   flat warmup, seeds ATR15
         flat(30, 100.0)
     ramp(30, 100.0, 108.0)                  # 6     approach
@@ -779,6 +820,24 @@ def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False, after="continue"):
         # below must produce nothing at all.
         ramp(12, bot, lvl - 8.0, w=0.0)
         star(rise(lvl - 8.0, lvl - 4.0) + 1.0)
+    elif after == "crossleg":
+        # A SECOND zone, and a leg at it that overlaps leg A's open position.
+        # Leg A is short from 99.25 with its stop at 102.31 and its target at
+        # 94.66, so everything below stays inside that band until the release
+        # is wanted -- otherwise A resolves early and there is nothing to
+        # overlap with. Leg A itself times out at bar 585, long before leg B
+        # arms, because only one leg runs at a time.
+        ramp(13, bot, 95.5, w=0.0)          # 17    dips to 95.5: PIVOT LOW
+        ramp(10, 95.5, 97.5, w=0.0)         #       back up inside the block
+        flat(90, 98.0, w=0.25)              # 18-20 lows 97.75; reveals at 20
+        for _ in range(2):                  # 21-22 two touches -> zone B born
+            ramp(10, 98.0, 95.5, w=0.0)
+            ramp(20, 95.5, 98.0, w=0.0)
+        ramp(10, 98.0, 95.5, w=0.0)         # 23    a 30s CLOSE inside the band
+        top = rise(95.5, 101.5)             #       departs -> LEG B arms long
+        hammer(98.25)                       # trigger while A is open: DROPPED
+        rise(top + 0.25, 103.0)             # through 102.31: A stops, gate opens
+        hammer(101.0)                       # ...and now the same setup FILLS
     return b
 
 
@@ -903,6 +962,31 @@ def _selfcheck_attempt_gate():
     print("attempt gate OK")
 
 
+def _selfcheck_cross_leg_gate():
+    """Flat to flat, GLOBALLY: a second leg at a second zone may not enter
+    while an earlier leg's position is still open, and may once it is not."""
+    p = PARAMS_PROVISIONAL
+    t = _fx_tape(_fx_bars(after="crossleg"))
+    eps = episodes(t, p)
+    f = [e for e in eps if e["kind"] == "filled"]
+    assert len(f) == 2, [(e["kind"], e["zone_px"], e["dir"]) for e in eps]
+    a, bl = f
+    assert (a["zone_px"], a["dir"]) == (110.0, -1), a
+    assert (bl["zone_px"], bl["dir"]) == (95.5, 1), bl    # a DIFFERENT leg
+    # When does A go flat? At its stop -- price never reaches its target here.
+    seg = t["px"][a["entry_tick"] + 1:]
+    a_exit = int(t["ts"][a["entry_tick"] + 1
+                         + int(np.flatnonzero(seg >= a["stop_px"] - 1e-9)[0])])
+    # Nothing at all is generated in between, by either leg. The fixture does
+    # print a tradeable leg-B trigger in that window (entry stop 101.00, and a
+    # bar opens at 101.25 inside its TTL) -- it produces no row because of the
+    # gate, not because there was nothing to suppress.
+    assert not [e for e in eps if e["kind"] in ("filled", "expired")
+                and a["trig_ts"] < e["trig_ts"] < a_exit], eps
+    assert bl["trig_ts"] > a_exit, (bl["trig_ts"], a_exit)
+    print("cross-leg gate OK")
+
+
 def _selfcheck_ttl_wall_clock():
     """entry_ttl_bars is wall clock: a hole in the tape must expire the entry,
     not carry it to whatever bar index happens to be six slots later."""
@@ -969,5 +1053,6 @@ if __name__ == "__main__":
     _selfcheck_episodes()
     _selfcheck_episodes_negative()
     _selfcheck_attempt_gate()
+    _selfcheck_cross_leg_gate()
     _selfcheck_ttl_wall_clock()
     _selfcheck_strategy()
