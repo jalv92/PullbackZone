@@ -73,6 +73,13 @@ The only tick-resolution elements are the resting orders themselves.
 - Within an active leg, after the leg has extended ≥ `impulse_min_atr30 × ATR30s`
   from its arming point, a counter-move of ≥ `pullback_min_atr30 × ATR30s` from the
   leg extreme arms the trigger hunt.
+- **Amendment 2026-08-05 (approved by Javier, pre-registered before any P&L was
+  observed):** the counter-move must SPAN at least 2 closed 30s bars — the hunt may
+  arm no earlier than the close of the SECOND bar after the bar that set the leg
+  extreme. Under the original rule 66% of armed hunts armed on a single bar's
+  counter-move (one wick), the same single-bar-range trap the feasibility study
+  documented. Structural rule, not a dial; `stop_buffer_atr30` is re-frozen under
+  it (one pre-registered pass — the pierce distribution changes).
 
 ### 4. TRIGGER (closed 30s candle, leg direction)
 
