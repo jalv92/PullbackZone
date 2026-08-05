@@ -21,6 +21,13 @@
 - PropSim path used by research scripts: `PROPSIM = Path(__file__).resolve().parents[1].parent / "PropSim"` (both repos live under `projects/Trading/`).
 - Commits: conventional prefixes (`feat:`, `test:`, `docs:`, `research:`), end with the Co-Authored-By Claude line.
 
+## Pinned rules added during execution (both sides implement identically)
+
+- **Attempt-2 gate (spec §7, pinned after Task 2 review):** after attempt 1 FILLS, the hunt is hard-off. Attempt 2 re-arms ONLY after a print at/beyond attempt 1's stop price is observed (pessimistic stop semantics: `px <= stop` long / `px >= stop` short) while the leg is still alive; a target-first print ends entries for the leg (no attempt 2). Re-arm requires a FRESH trigger candle on a later closed 30s bar.
+- **Entry TTL is wall-clock:** the fill window is prints with `ts` in `(trigger_bar_close, trigger_bar_close + entry_ttl_bars*30s]` — bar-index bounds alone walk across tape holes (the tape has documented 3,500-second jumps).
+- **Zone `touched` resets each session:** a touch recorded one session cannot arm a leg in a later session (spec §2's "touches and then departs" is one continuous event).
+- **Breakeven array is a PRICE** (engine contract): `be = entry ± breakeven_at_r × risk`; the engine reads the offset from the key `breakeven_offset_ticks` — `entries()` aliases `p["breakeven_offset_ticks"] = p["be_offset_ticks"]` so the closed list keeps one public name.
+
 ## Known mirror deltas (accepted, documented — do not "fix" silently)
 
 1. `daily_loss_r > 0` couples future entries to prior outcomes; PropSim's `entries()` is precomputed and cannot know closures. Default is 0 (off); the V1 mirror gate runs with it off. Same class as LatigoBreak delta 3.
