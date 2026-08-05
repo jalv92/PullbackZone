@@ -5,10 +5,10 @@ Spec: docs/specs/2026-08-05-pullbackzone-design.md. Parameter list is CLOSED
 and mirrors ninjascript/PullbackZoneStrategy.cs one-to-one.
 
 Sandbox: the loader injects `np` and `tp` (and Strategy/Param) rather than
-letting a plugin import anything, so the numpy import below is PENDING a
-PropSim allowlist change (Task 3) and is currently the one thing failing
-`plugins.py --check`. It exists so this file runs its own selfchecks
-standalone.
+letting a plugin import anything, but numpy imports are allowed anyway (the
+injected `np` binding grants nothing an explicit import doesn't) as of
+PropSim commit de0abdf. Passes `plugins.py --check` clean. The import exists
+so this file runs its own selfchecks standalone.
 """
 import numpy as np
 
