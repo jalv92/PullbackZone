@@ -175,10 +175,24 @@ def _approaches(D, p):
 
 def m1_zone_width(D, p, swings=False):
     """The NEAREST later approach to each pivot level, in ATR15s. One
-    observation per level, so it is cap-free, and it reads straight off as the
-    dial it sets: a band of half-width w gives this pivot at least one touch
-    iff w >= the value. The CDF therefore IS "fraction of pivot levels a band
-    of width w touches at all", and p60 is the width that reaches 60% of them.
+    observation per level, so it is cap-free, and it reads as the dial it sets:
+    a band of half-width w gives this pivot at least one touch when w >= the
+    value, so the CDF approximates "fraction of pivot levels a band of width w
+    touches at all" and p60 is roughly the width that reaches 60% of them.
+
+    Approximates, NOT "iff" -- three slacks separate this metric from what
+    `zones` scores:
+      1. ATR: the band is frozen at the ATR15 of the pivot's REVEAL bar, this
+         normalises by the ATR15 of the approach bar.
+      2. Rejection test: `zones` wants the close outside the NEAR EDGE, this
+         wants it on the pivot's side -- they differ inside the band itself.
+      3. Count: a zone needs `zone_min_touches` (2), this takes the first.
+    Left uncorrected on purpose. Closing slack 1 and 2 means solving for the
+    smallest w that makes a bar both reach the near edge and close outside it,
+    which also changes WHICH pivots are eligible (n 547 -> 894 on the full
+    sample) -- so it is a different population, not a corrected reading of this
+    one, and the p60 of the two is not comparable. The dial rests on the
+    percentile of the metric as defined here.
 
     `swings=False` (the frozen form) scores any later bar, which is literally
     what `zones` tests -- `h[i] >= edge and c[i] < edge`, a bar, not a swing.
@@ -374,7 +388,10 @@ def leg_walk(D, p, floors=None):
             continue
         if not leg["impulse"]:
             leg["impulse"] = d * (leg["ext"] - leg["arm_px"]) >= imp_f * a30v
-        if not leg["impulse"] or leg["depth"] < pb_f:
+        # Spec amendment 2026-08-05: the hunt arms no earlier than the close of
+        # the SECOND bar after the leg extreme. Mirrors `episodes` exactly --
+        # the measurement population has to be the one the machine trades.
+        if not leg["impulse"] or leg["depth"] < pb_f or i - leg["ext_i"] < 2:
             continue
         if leg["hunt_i"] < 0:
             leg["hunt_i"] = i           # bars from the extreme to the arming
@@ -515,7 +532,8 @@ def main():
     print("\n" + "=" * 100)
     print("FROZEN VALUES -- pre-registered percentile per dial, two windows")
     print(f"  {'dial':<20} {'pct':>4} {'recent':>7} {'[95% CI]':>15} "
-          f"{'full':>7} {'[95% CI]':>15} {'ratio':>6} {'warm-in r/f':>12}")
+          f"{'full':>7} {'[95% CI]':>15} {'ratio':>6} {'warm-in r/f':>12} "
+          f"{'raw full':>9}")
     blocked = []
     for k, q in DIALS:
         a_, b_ = res[wins[0][0]]["out"][k], res[wins[1][0]]["out"][k]
@@ -526,10 +544,12 @@ def main():
         overlap = a_["ci"][0] <= b_["ci"][1] and b_["ci"][0] <= a_["ci"][1]
         if ratio > 2.0:
             blocked.append((k, rv, fv, ratio, overlap))
+        # `raw` is the unsnapped percentile. Printed because quoting a snapped
+        # value as the raw one in a provenance comment is an easy, silent lie.
         print(f"  {k:<20} p{q:<3} {rv:7.2f} "
               f"[{a_['ci'][0]:5.2f},{a_['ci'][1]:6.2f}] {fv:7.2f} "
               f"[{b_['ci'][0]:5.2f},{b_['ci'][1]:6.2f}] {ratio:6.2f} "
-              f"{wr:5.2f} /{wf:5.2f}")
+              f"{wr:5.2f} /{wf:5.2f} {b_['raw']:9.3f}  n={b_['n']}")
     print("\n  frozen = the FULL-sample value (the bigger sample); the recent "
           "window is the\n  regime-disagreement gate, and >2x on any dial "
           "blocks the freeze.")
@@ -617,9 +637,9 @@ def main():
               f" -> {bar_range_rate(D, PROVISIONAL['pullback_min_atr30']):6.1%}"
               f"   now {pb:.2f} -> {bar_range_rate(D, pb):6.1%}"
               f"   |  impulse floor {im:.2f} -> {bar_range_rate(D, im):6.1%}")
-    print("\n  ...and IN SITU: of the hunts the walk actually armed, how many")
-    print("  armed on the very first bar after the leg extreme -- one bar of")
-    print("  counter-move WAS the whole pullback:")
+    print("\n  ...and IN SITU: how many bars after the leg extreme the hunt")
+    print("  actually armed. The >=2-bar amendment makes lag 1 structurally")
+    print("  impossible, so this is the shape of what is left:")
     p_fro = dict(PARAMS_DEFAULT, **frozen)
     for label, _ in wins:
         D = res[label]["D"]
@@ -628,10 +648,12 @@ def main():
                           (f"frozen {pb:.2f}", pb)):
             lag = leg_walk(D, p_fro, floors=(im, floor))["lag"]
             lag = lag[lag > 0]
-            if len(lag):
-                print(f"    {label:<10} {nm:<18} armed {len(lag):5}  "
-                      f"lag==1 bar: {np.mean(lag == 1):5.1%}   "
-                      f"median lag {int(np.median(lag))} bars")
+            if not len(lag):
+                continue
+            hist = "  ".join(f"lag{v}: {np.mean(lag == v):5.1%}"
+                             for v in (1, 2, 3, 4))
+            print(f"    {label:<10} {nm:<18} armed {len(lag):5}  {hist}  "
+                  f"lag>=5: {np.mean(lag >= 5):5.1%}  median {int(np.median(lag))}")
 
     print("\n" + "=" * 100)
     print("WHAT THE VALUES IMPLY (behaviour and stop DISTANCE, never P&L)")

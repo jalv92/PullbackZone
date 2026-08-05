@@ -80,6 +80,10 @@ The only tick-resolution elements are the resting orders themselves.
   counter-move (one wick), the same single-bar-range trap the feasibility study
   documented. Structural rule, not a dial; `stop_buffer_atr30` is re-frozen under
   it (one pre-registered pass — the pierce distribution changes).
+  **Implemented and verified 2026-08-05:** single-bar arming is now structurally
+  0% (was 66%); of what remains, 85% arms at lag 2 and the median lag is 2 bars.
+  A new leg extreme resets the bar count exactly as it already resets the
+  pullback. Both mirror sides implement the identical bar-count rule.
 
 ### 4. TRIGGER (closed 30s candle, leg direction)
 
@@ -175,7 +179,7 @@ are internal constants, not parameters (dial bloat burned a search ledger before
 | Triggers | `use_engulfing` / `use_hammer` / `use_doji_star` | true / true / true | no |
 | Entry | `entry_offset_ticks` | 2 | no |
 | | `entry_ttl_bars` | 6 | no |
-| Exits | `stop_buffer_atr30` | **1.30** | **yes** — p80, frozen 2026-08-05 |
+| Exits | `stop_buffer_atr30` | **1.25** | **yes** — p80, re-frozen 2026-08-05 under the ≥2-bar amendment |
 | | `target_r` | 1.5 | no |
 | | `breakeven_at_r` / `be_offset_ticks` | 0 (off) / 4 | no |
 | Size/guards | `contracts` | 1 | no |
@@ -190,40 +194,77 @@ sample side by side. Every default is a **percentile of market behavior**; no
 profit, win rate or R multiple is computed anywhere in that file. Values are the
 full-sample figure snapped to 0.05, warmup bars of each session excluded.
 
-| Dial | Rule | Recent 30 | Full 238 | Ratio | **Frozen** |
+| Dial | Rule | Recent 30 | Full 238 (raw, n) | Ratio | **Frozen** |
 |---|---|---|---|---|---|
-| `zone_width_atr15` | p60 nearest later bar approach to a live pivot | 0.30 | 0.30 | 1.00 | **0.30** |
-| `leg_min_atr15` | p40 max departure from the zone edge ≤30 min after a touch | 0.30 | 0.40 | 1.33 | **0.40** |
-| `impulse_min_atr30` | p50 leg extension at pullbacks that made a NEW extreme | 3.20 | 2.70 | 1.19 | **2.70** |
-| `pullback_min_atr30` | p30 retracement depth of those same pullbacks | 1.15 | 1.15 | 1.00 | **1.15** |
-| `stop_buffer_atr30` | p80 adverse pierce past the trigger-time pullback extreme | 1.30 | 1.30 | 1.00 | **1.30** |
+| `zone_width_atr15` | p60 nearest later bar approach to a live pivot | 0.30 | 0.301, n=547 | 1.00 | **0.30** |
+| `leg_min_atr15` | p40 max departure from the zone edge ≤30 min after a touch | 0.30 | 0.390, n=2836 | 1.33 | **0.40** |
+| `impulse_min_atr30` | p50 leg extension at pullbacks that made a NEW extreme | 3.20 | 2.707, n=1633 | 1.19 | **2.70** |
+| `pullback_min_atr30` | p30 retracement depth of those same pullbacks | 1.15 | 1.139, n=1633 | 1.00 | **1.15** |
+| `stop_buffer_atr30` | p80 adverse pierce past the trigger-time pullback extreme | 1.30 | 1.234, n=370 | 1.04 | **1.25** |
 
 Pre-registered regime gate (>2× disagreement between the two windows blocks a
 freeze): **PASS**, worst ratio 1.33. Dependency order was single-pass
 `zone_width → leg_min → impulse/pullback → stop_buffer`; no dial was re-picked
 after seeing a downstream result.
 
-What the frozen dials imply, full sample: **4.82 episodes/session, 1.47 fills/session**,
-risk per trade p50 **123 ticks ($617 at 1 NQ)**, p90 243 ticks ($1,216), max 754 ticks.
-A $1,200 prop daily-loss limit is therefore roughly *one* p90 stop-out or two median
-ones — the strategy is 1-contract-only on NQ at that envelope, and the risk manager
-has veto.
+`stop_buffer_atr30` was **re-frozen once** (1.30 → 1.25) under the §3 ≥2-bar
+amendment, which moves the trigger later and so changes the pierce population.
+That pass was pre-registered, ran alone, and re-passed the gate at 1.04. The other
+four dials reproduce to the digit under the amendment — it gates the hunt, not the
+retracement distributions they are measured from.
 
-Three findings that survive the freeze and belong in `docs/validation.md`:
+What the frozen dials imply, full sample: **4.81 episodes/session, 1.47 fills/session**,
+risk per trade p50 **125 ticks ($626 at 1 NQ)**, p90 225 ticks ($1,124), max 746 ticks
+($3,728). A $1,200 prop daily-loss limit absorbs roughly *one* p90 stop-out (≈91% of
+it) or two median ones — 1 contract only on NQ at that envelope, MNQ below a $50k
+account, and the risk manager has veto.
 
-1. **The pullback is usually one bar.** 66% of the hunts the frozen floor arms are
-   armed by a single 30s bar of counter-move (77% at the old 1.00 floor). Raising
-   the floor per the pre-registered rule reduced the problem without fixing it.
-   Requiring a pullback to span ≥2 bars is a **spec change**, not a recalibration —
-   it must be its own pre-registered run.
+### Audit trail (keep — this is the durable record)
+
+- **The gate tripped once, and it was a measurement bug, not a regime.** The first
+  chain used a swing-rejection form of M1, which put `zone_width` at 0.70, starved
+  the recent window's pierce sample to n=22, and produced `stop_buffer` 0.40 vs 1.15
+  — a **2.87× trip**. The bootstrap CIs overlapped, diagnosing sample starvation
+  rather than a regime shift. M1 was corrected upstream on structural grounds (a
+  *bar* is what `zones` tests, not a swing) and the chain re-derived once; the same
+  dial then agreed at 1.00×. `calibrate.py` prints the alternative swing-chain column
+  permanently so the fork stays auditable.
+- **M1 could not be measured as originally specified.** "Distribution across later
+  touches" is circular — whether a bar *is* a touch is what the width decides — and
+  the answer just tracked the assumed neighbourhood (p60 ≈ 0.5 × cap, because
+  approach distances are near-uniform: **15m pivot levels show no measurable
+  clustering of later approaches at ATR15 resolution**). Replaced with one cap-free
+  order statistic per level. The metric has three known slacks vs what `zones`
+  scores (reveal-bar vs approach-bar ATR; close-outside-near-edge vs close-on-pivot-
+  side; `min_touches`=2 vs first approach) — documented in the function, left
+  uncorrected because closing them changes the eligible population (n 547 → 894)
+  rather than correcting a reading of this one.
+- **Dossier reconciliation.** Task 2's "median 149 ticks, max 230" reproduces on its
+  slice — the **last 10 sessions of NQ 09-26 (2026-07-23 → 2026-08-05)** under
+  provisional dials: min 59, median 149, p90 320, max 456. The max moved because the
+  attempt-2 and flat-to-flat gates changed the fill set there (6 → 7 fills). It is
+  not the ALL-sample figure and was never comparable to one.
+
+### Findings that survive the freeze (carry into `docs/validation.md`)
+
+1. **The one-bar pullback is fixed, structurally.** It was 66% of armed hunts (77%
+   at the provisional floor); the ≥2-bar amendment makes lag 1 impossible. Of what
+   remains: lag 2 = 85.0%, lag 3 = 6.9%, lag 4 = 2.9%, lag ≥5 = 5.2%, median 2 bars.
+   The pullback is now *at minimum* two bars, but it is still typically **exactly**
+   two — this bought structure, not depth.
 2. **Zone touches are mostly drift, not rejections.** A band of 0.30 × ATR15 touches
    60% of pivot levels, but catching a *confirmed swing rejection* 60% of the time
    would need ≈1.5 × ATR15 — five times wider. The zone premise is weaker than the
-   design assumed.
+   design assumed. This one is **not** addressed by any amendment.
 3. **Early-session ATR is elevated by real volatility, not mainly by the gap.** The
-   raw 30s bar range averages 38.8 pts at the open vs 11.4 pts later, so the
-   no-session-reset ATR convention costs less than feared; excluding warmup bars
-   moved no dial by more than 0.10.
+   gap is large where it lands (mean 30s *true* range 186.1 pts at bar 0 vs a mean
+   *range* of 38.8 pts), but the raw range — which cannot contain a gap — is itself
+   elevated all through the early session (38.8 → 23.9 → 21.0 → 11.4 pts by position
+   bucket). Excluding warmup bars moves `leg_min` and `pullback` not at all,
+   `impulse` by 0.05 and `zone_width` by 0.10 on the full sample; the exceptions are
+   `stop_buffer` (frozen 1.25 vs warm-in 1.10) and the *recent-window* `impulse`
+   (3.20 vs warm-in 2.65), so the earlier blanket claim of "no dial by more than
+   0.10" was wrong.
 
 Any later change to a frozen value is a new pre-registered run, not a tweak.
 

@@ -48,30 +48,33 @@ _NET_EPOCH_S = 62135596800             # seconds from 0001-01-01 to 1970-01-01
 PARAMS_DEFAULT = dict(
     zone_pivot_k=3, zone_min_touches=2,
     # p60 of the nearest later bar approach to a live 15m pivot, ATR15s
-    # (raw 0.30, 95% CI [0.26, 0.36], n=547): the half-width at which 60% of
+    # (raw 0.301, 95% CI [0.26, 0.36], n=547): the half-width at which 60% of
     # pivot levels are touched at all.
     zone_width_atr15=0.30,
     zone_expiry_sessions=2, zone_break_atr15=0.25,
     # p40 of the max departure from a zone EDGE within 30 min of a touch
-    # (raw 0.40, CI [0.38, 0.41], n=2836): below it departures chop back.
+    # (raw 0.390, CI [0.38, 0.41], n=2836): below it departures chop back.
     leg_min_atr15=0.40,
     leg_timeout_min=60, max_attempts_per_leg=2,
     # p50 of the leg extension at pullbacks that went on to a NEW extreme
-    # (raw 2.71, CI [2.56, 2.89], n=1633). Clears single-bar noise by a wide
+    # (raw 2.707, CI [2.56, 2.89], n=1633). Clears single-bar noise by a wide
     # margin: only 0.4% of 30s bars have a range this big on their own.
     impulse_min_atr30=2.70,
     # p30 of the retracement depth of those same continuation pullbacks
-    # (raw 1.15, CI [1.10, 1.19]). KNOWN WEAKNESS, see docs/validation.md:
-    # 66% of the hunts this floor arms are still armed by ONE bar of
-    # counter-move. The floor is what the pre-registered rule returned; making
-    # a pullback span 2+ bars is a spec change, not a calibration.
+    # (raw 1.139, CI [1.10, 1.19], n=1633). This floor alone let 66% of hunts arm
+    # on ONE bar's wick; the amendment of the same date (>=2 closed bars, see
+    # `episodes`) is what fixed that, not this number, which the amendment
+    # leaves untouched -- it gates the hunt, not the retracement distribution.
     pullback_min_atr30=1.15,
     use_engulfing=1, use_hammer=1, use_doji_star=1,
     entry_offset_ticks=2, entry_ttl_bars=6,
     # p80 of the adverse pierce past the trigger-time pullback extreme among
-    # pullbacks that did continue (raw 1.28, CI [0.94, 1.58], n=412). 2.6x the
+    # pullbacks that did continue. RE-FROZEN 2026-08-05 under the >=2-bar
+    # amendment, which moves the trigger later and so changes the pierce
+    # population: 1.30 -> 1.25 (raw 1.234, CI [0.92, 1.58], n=370; recent-window
+    # 1.30, ratio 1.04). One pre-registered pass, gate PASS. 2.5x the
     # provisional -- Javier's "real NQ volatility, not token ticks", measured.
-    stop_buffer_atr30=1.30,
+    stop_buffer_atr30=1.25,
     target_r=1.5, breakeven_at_r=0.0, be_offset_ticks=4,
     contracts=1, daily_loss_r=0.0, flatten_hhmm=1558,
 )
@@ -454,8 +457,9 @@ def episodes(tape, p):
                 z["touched"] = False        # this touch is spent on this leg
                 leg = dict(z=z, dir=d, arm_px=float(c30[i]), ext=float(c30[i]),
                            pull=float(c30[i]), hunt=False, impulse=False,
-                           fills=0, max_att=max_att, block=-1, t0=int(tc30[i]),
-                           arm_ts=int(tc30[i]), day=int(dayn[i]))
+                           ext_i=i, fills=0, max_att=max_att, block=-1,
+                           t0=int(tc30[i]), arm_ts=int(tc30[i]),
+                           day=int(dayn[i]))
                 break
             continue        # extension is measured FROM the arming point
 
@@ -471,6 +475,7 @@ def episodes(tape, p):
         ext = float(h30[i] if d > 0 else l30[i])
         if d * (ext - leg["ext"]) > 0:
             leg["ext"] = leg["pull"] = ext
+            leg["ext_i"] = i
             leg["hunt"] = False
         else:
             cnt = float(l30[i] if d > 0 else h30[i])
@@ -479,7 +484,14 @@ def episodes(tape, p):
         if not leg["impulse"]:
             leg["impulse"] = (d * (leg["ext"] - leg["arm_px"])
                               >= p["impulse_min_atr30"] * a30)
-        if leg["impulse"] and not leg["hunt"]:
+        # SPEC AMENDMENT 2026-08-05 (Javier-approved, pre-registered before any
+        # P&L was observed): the counter-move must SPAN >= 2 closed bars, so the
+        # hunt arms no earlier than the close of the SECOND bar after the one
+        # that set the leg extreme. Under the original rule 66% of armed hunts
+        # armed on a single bar's wick -- the feasibility study's single-bar
+        # trap. Structural, no new dial; a new extreme resets the count exactly
+        # as it already resets the pullback (`ext_i` moves with `ext`).
+        if leg["impulse"] and not leg["hunt"] and i - leg["ext_i"] >= 2:
             leg["hunt"] = (d * (leg["ext"] - leg["pull"])
                            >= p["pullback_min_atr30"] * a30)
         if not leg["hunt"] or i <= leg["block"]:
@@ -632,7 +644,7 @@ class PullbackZone(Strategy):
                                               "candle's extreme, ticks", fixed=True),
         "entry_ttl_bars": Param(6, 1, 40, "working life of the entry, 30s bars",
                                 fixed=True),
-        "stop_buffer_atr30": Param(1.30, 0.05, 3.0, "stop beyond the pullback "
+        "stop_buffer_atr30": Param(1.25, 0.05, 3.0, "stop beyond the pullback "
                                                     "extreme, ATR30s", fixed=True),
         "target_r": Param(1.5, 0.5, 6.0, "target as a multiple of risk"),
         "breakeven_at_r": Param(0.0, 0.0, 5.0, "move the stop to entry at this "
@@ -739,13 +751,19 @@ def _selfcheck_zones():
     print("zones OK")
 
 
-def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False, after="continue"):
+def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False, after="continue",
+             pullback="normal"):
     """The 30s bar path of the episode fixture: one RTH session containing a
     15m pivot high at exactly 110.0, two touches, a short leg, an impulse, a
     pullback, a shooting star and a fill.
 
     Blocks 0..16 are exactly 30 bars each, so a block index IS a 15m bar
     index; after the zone is born the layout stops caring.
+
+    `pullback` swaps the retracement for the >=2-bar amendment's paired
+    fixtures: "onebar" puts the whole counter-move in the FIRST bar after the
+    leg extreme, "twobar" is the identical star one bar later. They differ by
+    one inserted bar and nothing else, so the pair isolates the bar-count rule.
 
     `after` picks what happens once attempt 1 has filled: "continue" runs the
     trade down and offers no second setup, "stopout" walks price back through
@@ -838,6 +856,20 @@ def _fx_bars(leg_low=99.0, touch2=True, fast_depart=False, after="continue"):
         # weakness rather than removing it (66% of armed hunts arm on a single
         # bar), so the fixture must keep dodging it to isolate what it tests.
         ramp(30, 104.0, leg_low, w=0.0)     # 16    impulse
+    if pullback != "normal":
+        # One shooting star deep enough to clear pullback_min on its own (the
+        # bar's own high IS the counter extreme, so no other bar contributes).
+        # "twobar" first inserts a plain bullish bar -- no candle predicate can
+        # claim it, and its low ties the extreme rather than beating it, so the
+        # extreme (and the bar count) does not reset.
+        if pullback == "twobar":
+            one(leg_low, leg_low + 0.5, leg_low, leg_low + 0.4)
+        one(leg_low + 0.25, leg_low + 4.0, leg_low, leg_low + 0.25)
+        # Prints through the entry stop (star low - entry_offset_ticks).
+        one(leg_low - 0.25, leg_low - 0.25, leg_low - 1.5, leg_low - 1.25)
+        flat(60, leg_low - 1.25, w=0.25)
+        return b
+
     lvl = rise(leg_low, leg_low + 2.0)      # 17+   pullback
     star(lvl + 1.0)                         # ATTEMPT 1: trigger + fill
     bot = lvl - 2.25                        # the fill bar's close
@@ -970,6 +1002,28 @@ def _selfcheck_episodes_negative():
     print("episodes (negative) OK")
 
 
+def _selfcheck_two_bar_pullback():
+    """Spec amendment 2026-08-05: the hunt arms no earlier than the close of
+    the SECOND bar after the leg extreme.
+
+    A paired fixture, the house pattern: both tapes carry the SAME shooting
+    star over the same extreme and differ by one inserted plain bar, so what
+    is being tested is the bar count and nothing else. Verified to bite -- with
+    the `i - ext_i >= 2` clause removed, "onebar" fills instead of producing
+    nothing.
+    """
+    p = PARAMS_DEFAULT
+    one = episodes(_fx_tape(_fx_bars(pullback="onebar")), p)
+    assert not [e for e in one if e["kind"] in ("filled", "expired")], one
+    assert [e for e in one if e["kind"] == "leg_died"], one   # the leg DID live
+
+    two = episodes(_fx_tape(_fx_bars(pullback="twobar")), p)
+    f = [e for e in two if e["kind"] == "filled"]
+    assert len(f) == 1, [(e["kind"], e["trig_kind"]) for e in two]
+    assert f[0]["trig_kind"] == "hammer" and f[0]["dir"] == -1, f[0]
+    print("two-bar pullback OK")
+
+
 def _selfcheck_attempt_gate():
     """Spec 7: the second attempt exists only if the first fill STOPS OUT."""
     p = PARAMS_DEFAULT
@@ -1087,6 +1141,7 @@ if __name__ == "__main__":
     _selfcheck_zones()
     _selfcheck_episodes()
     _selfcheck_episodes_negative()
+    _selfcheck_two_bar_pullback()
     _selfcheck_attempt_gate()
     _selfcheck_cross_leg_gate()
     _selfcheck_ttl_wall_clock()
