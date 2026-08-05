@@ -38,6 +38,7 @@
 4. Intra-bar exits: ~6.5% of fills (4/61 measured) have the freeing exit print landing inside the trigger bar itself. PropSim answers by print order; NT8's `Position.MarketPosition` may lag `OnExecutionUpdate` at that bar close. These rows are the EXPECTED divergence candidates — Task 7's gate classifies them separately instead of failing the pattern on them.
 5. `busy`/TTL anchors on the trigger bar's last-TICK timestamp, not the nominal bar boundary — cross-leg suppression inherits tick jitter. Accepted with the wall-clock TTL delta; Task 7 should not chase 1-bar edge disagreements here.
 6. The corpus carries no absolute fill timestamp (`entry_tick` is slice-relative). Task 7 joins on `trig_ts` (absolute) and must re-derive fills from an IDENTICAL tape slice — always pass an explicit `--contract` to `dump_episodes.py` (its `ALL` default spans rolls and is NOT what a Replay session compares against).
+7. Amendment 2's `i == ext_i + 2` window is CATEGORICAL under a one-bar index disagreement: where a `>=` rule would merely delay arming, a bar-boundary difference between the two sides flips arm → never-arm for that extreme. The .cs must build its 30s series so bar boundaries equal PropSim's (RTH template, 09:30 grid), and Task 7's gate watches never-armed-on-one-side disagreements as this delta's signature.
 
 ---
 

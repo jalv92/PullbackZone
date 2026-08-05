@@ -275,7 +275,7 @@ MNQ below a $50k account, and the risk manager has veto.
    elevated all through the early session (38.8 → 23.9 → 21.0 → 11.4 pts by position
    bucket). Excluding warmup bars moves `leg_min` and `pullback` not at all,
    `impulse` by 0.05 and `zone_width` by 0.10 on the full sample; the exceptions are
-   `stop_buffer` (frozen 1.25 vs warm-in 1.10) and the *recent-window* `impulse`
+   `stop_buffer` (frozen 1.30 vs warm-in 1.05 under Amendment 2) and the *recent-window* `impulse`
    (3.20 vs warm-in 2.65), so the earlier blanket claim of "no dial by more than
    0.10" was wrong.
 
