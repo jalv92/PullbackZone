@@ -73,17 +73,24 @@ The only tick-resolution elements are the resting orders themselves.
 - Within an active leg, after the leg has extended ≥ `impulse_min_atr30 × ATR30s`
   from its arming point, a counter-move of ≥ `pullback_min_atr30 × ATR30s` from the
   leg extreme arms the trigger hunt.
-- **Amendment 2026-08-05 (approved by Javier, pre-registered before any P&L was
-  observed):** the counter-move must SPAN at least 2 closed 30s bars — the hunt may
-  arm no earlier than the close of the SECOND bar after the bar that set the leg
-  extreme. Under the original rule 66% of armed hunts armed on a single bar's
-  counter-move (one wick), the same single-bar-range trap the feasibility study
-  documented. Structural rule, not a dial; `stop_buffer_atr30` is re-frozen under
-  it (one pre-registered pass — the pierce distribution changes).
-  **Implemented and verified 2026-08-05:** single-bar arming is now structurally
-  0% (was 66%); of what remains, 85% arms at lag 2 and the median lag is 2 bars.
-  A new leg extreme resets the bar count exactly as it already resets the
-  pullback. Both mirror sides implement the identical bar-count rule.
+- **Amendment 2 — the FAST-PULLBACK WINDOW (approved by Javier 2026-08-05,
+  supersedes Amendment 1; pre-registered before any P&L was observed):** the
+  trigger hunt arms ONLY at the close of the second bar after the bar that set
+  the leg extreme (`i == ext_i + 2`), using the pullback extreme known through
+  that bar. Consequences, both intended: (a) a one-bar wick MAY deliver the whole
+  depth — the owner explicitly wants sharp pullbacks ("1 mecha vale"); (b) depth
+  that arrives LATER than the second bar never arms for that extreme — slow-grind
+  retracements are excluded ("tope 2 barras"). A new leg extreme resets the
+  window. `stop_buffer_atr30` is re-frozen under this rule (one pre-registered
+  pass per amendment).
+  **Honesty note (from the round-2 re-review):** Amendment 1 as first implemented
+  was a latency rule, not a span rule — 67.6% of armed hunts still had their
+  depth delivered by the single bar after the extreme, and two documents
+  overclaimed "fixed structurally". Amendment 2 resolves the discrepancy by
+  DECISION, not by measurement: one-bar delivery is accepted as a design choice.
+  The feasibility study's single-bar-noise concern therefore REMAINS a live,
+  pre-registered suspicion for V2 in `docs/validation.md` — the burden of proof
+  is unchanged.
 
 ### 4. TRIGGER (closed 30s candle, leg direction)
 
