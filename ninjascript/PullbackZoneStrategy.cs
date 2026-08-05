@@ -33,16 +33,18 @@
 // put the two mirror sides on different ATRs for the first 14 bars of the
 // loaded data and every threshold is an ATR multiple.
 //
-// Zone folding runs from the PRIMARY branch, not from BarsInProgress 1. When a
-// 30s bar and a 15m bar close on the same timestamp, PropSim treats the 15m bar
-// as already closed (`searchsorted(tc15, tc30, "right") - 1`), while NT8's
-// dispatch order between two series closing at the same instant is not
-// something this code should bet on. Folding 15m bars from the 30s branch —
-// every bar whose close time is at or before this 30s close, exactly once —
-// reproduces PropSim's rule whichever way NT8 dispatches. No lookahead: a
-// time-based bar is stamped at its close, so a 15m bar stamped 09:45:00 holds
-// only ticks before 09:45:00 and is complete when the 30s bar stamped 09:45:00
-// closes.
+// Zone folding runs from the PRIMARY branch, not from BarsInProgress 1, and
+// reads the 15m series by ABSOLUTE index. When a 30s bar and a 15m bar close on
+// the same timestamp, PropSim treats the 15m bar as already closed
+// (`searchsorted(tc15, tc30, "right") - 1`), but NT8 processes the PRIMARY
+// series first on a shared timestamp — so both the 15m branch and the barsAgo
+// accessors (which ride the secondary's processing pointer) would hand back the
+// PREVIOUS 15m bar at that moment, one bar late, every 15m boundary of every
+// session. `BarsArray[1].GetHigh(j)` and friends read the series itself rather
+// than the pointer. No lookahead: a time-based bar is stamped at its close, so
+// a 15m bar stamped 09:45:00 holds only ticks before 09:45:00 and is complete
+// when the 30s bar stamped 09:45:00 closes — and the fold loop's time guard is
+// what enforces that. See FoldClosedZoneBars (plan delta 9).
 #region Using declarations
 using System;
 using System.Collections.Generic;
@@ -89,7 +91,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             public bool Dead;
             public DateTime BornTime, DiedTime;
             public DateTime BornDay;             // day15[born_i], as a calendar date
-            public bool DeadDrawn;
         }
 
         // A revealed pivot accumulating touches; not a zone until touch
@@ -128,12 +129,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime _lastBarTime = DateTime.MinValue;
         private int _cutoffSecs;
         private int _barSecs = 30;
+        private const int RthOpenSecs = 9 * 3600 + 30 * 60;
+        private bool _ethWarned;
 
         // Rewind fence. Playback rewinds replay bars the strategy has already
-        // logged; stamping every corpus row with the epoch lets Task 7 drop the
-        // discarded pass instead of joining a session twice (LatigoBreak lesson
-        // — fence by epoch, not by a boolean).
-        private int _epoch;
+        // logged; stamping every corpus row lets Task 7 drop the discarded pass
+        // instead of joining a session twice (LatigoBreak lesson — fence by
+        // epoch, not by a boolean). A wall-clock stamp rather than a counter, so
+        // the corpus stays self-describing across separate RUNS too: a per-
+        // instance counter restarts at the same value every launch and two runs
+        // of the same session would be indistinguishable.
+        private long _epoch;
 
         private static readonly object _corpusLock = new object();
         private string _corpusPath;
@@ -233,7 +239,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             _atr15 = 0;
             _prev15Close = 0;
             _prevDay30 = DateTime.MinValue;
-            _epoch++;
+            _epoch = DateTime.UtcNow.Ticks;
         }
 
         private string Tag(string t)
@@ -245,8 +251,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnBarUpdate()
         {
             // All work happens on the 30s branch, zone folding included (header
-            // note): the 15m branch would tie zone availability to NT8's
-            // same-timestamp dispatch order.
+            // note): NT8 processes the primary FIRST on a shared timestamp, so
+            // a 15m branch would deliver every zone one 30s bar late.
             if (BarsInProgress != 0 || CurrentBar < 0)
                 return;
 
@@ -255,14 +261,25 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ResetAll(true);
             _lastBarTime = t;
 
+            // An ETH template feeds the overnight session into both ATR
+            // recursions and into the pivot windows, which voids the mirror.
+            // Detection only, once per run — the strategy does not gate on it.
+            if (!_ethWarned && BarStartSecs() < RthOpenSecs)
+            {
+                _ethWarned = true;
+                Log(Name + ": a primary bar opened before 09:30 ET — this looks like an ETH session template, not the RTH one PropSim mirrors. Both ATR recursions and every zone are contaminated on this chart.",
+                    Cbi.LogLevel.Warning);
+            }
+
             // ATR30 first and unconditionally: PropSim builds the whole atr30
             // array before its loop, so every bar advances the recursion even
             // when the bar is skipped below.
             _atr30Series[0] = ComputeAtr30();
 
-            if (CurrentBars[Zone15Idx] < 0)
-                return;
-
+            // No CurrentBars[Zone15Idx] guard: that reads the same processing
+            // pointer the fold deliberately avoids, and at the first 15m bar of
+            // the run it still says -1 while the series already holds the bar.
+            // An empty series has Count 0 and the fold loop simply does nothing.
             FoldClosedZoneBars();                    // 15m: pivots, touches, births, deaths, merges
 
             // A touch does not survive the overnight gap. A zone outlives the
@@ -289,27 +306,33 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // Fold every 15m bar that has closed at or before this 30s bar's close,
         // exactly once, in order.
+        //
+        // Bars.Count spans the WHOLE loaded series, future bars included, so the
+        // `> Time[0]` guard is the ONLY thing standing between this loop and
+        // lookahead. IT MUST NEVER BE WEAKENED.
         private void FoldClosedZoneBars()
         {
-            int last = CurrentBars[Zone15Idx];
+            Bars b15 = BarsArray[Zone15Idx];
             bool folded = false;
-            for (int j = _zoneBarDone + 1; j <= last; j++)
+            for (int j = _zoneBarDone + 1; j < b15.Count; j++)
             {
-                int ago = last - j;
-                if (Times[Zone15Idx][ago] > Time[0])
+                if (b15.GetTime(j) > Time[0])
                     break;                           // not closed yet
-                FoldZoneBar(ago);
+                FoldZoneBar(b15, j);
                 _zoneBarDone = j;
                 folded = true;
             }
             if (folded)
-                DrawZones();
+            {
+                DrawZones();                         // greys the dead ones one last time
+                _zones.RemoveAll(z => z.Dead);       // the 30s hot path only walks live zones
+            }
         }
 
-        private void FoldZoneBar(int ago)
+        private void FoldZoneBar(Bars b15, int j)
         {
-            double h = Highs[Zone15Idx][ago], l = Lows[Zone15Idx][ago], c = Closes[Zone15Idx][ago];
-            DateTime t = Times[Zone15Idx][ago];
+            double h = b15.GetHigh(j), l = b15.GetLow(j), c = b15.GetClose(j);
+            DateTime t = b15.GetTime(j);
 
             // wilder_atr on the 15m series. TrueRange reaches ACROSS the session
             // break, exactly like NinjaTrader's own recursion — deliberate, and
@@ -331,14 +354,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             // by this close. Strict-unique max/min over the 2k+1 window; highs
             // are offered before lows, as in the Python's reveal dict.
             int k = ZonePivotK;
-            if (ago + 2 * k <= CurrentBars[Zone15Idx])
+            if (j - 2 * k >= 0)
             {
-                double ph = Highs[Zone15Idx][ago + k], pl = Lows[Zone15Idx][ago + k];
+                double ph = b15.GetHigh(j - k), pl = b15.GetLow(j - k);
                 bool hiMax = true, loMin = true;
                 int hiEq = 0, loEq = 0;
-                for (int w = 0; w <= 2 * k; w++)
+                for (int w = j - 2 * k; w <= j; w++)
                 {
-                    double wh = Highs[Zone15Idx][ago + w], wl = Lows[Zone15Idx][ago + w];
+                    double wh = b15.GetHigh(w), wl = b15.GetLow(w);
                     if (wh > ph) hiMax = false;
                     else if (wh == ph) hiEq++;
                     if (wl < pl) loMin = false;
@@ -649,17 +672,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (!ShowDrawings || ChartControl == null)
                 return;
+            // Dead zones get this one final grey draw and are then pruned by
+            // the caller, so the box stays on the chart while the object does
+            // not stay in the hot path.
             foreach (Zone z in _zones)
             {
-                if (z.Dead && z.DeadDrawn)
-                    continue;
                 Brush b = z.Dead ? Brushes.Gray : (z.PivotHigh ? Brushes.OrangeRed : Brushes.DodgerBlue);
                 Draw.Rectangle(this, Tag("PZ_Z" + z.Id), false,
                     z.BornTime, z.Px + z.HalfW,
                     z.Dead ? z.DiedTime : Time[0], z.Px - z.HalfW,
                     b, b, z.Dead ? 4 : 12);
-                if (z.Dead)
-                    z.DeadDrawn = true;
             }
         }
 
@@ -683,13 +705,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool trig = trigKind != null;
             StringBuilder sb = new StringBuilder(512);
             sb.Append("{\"kind\":\"").Append(kind).Append("\"")
-              .Append(",\"dir\":").Append(_leg.Dir)
+              .Append(",\"dir\":").Append(_leg.Dir.ToString(CultureInfo.InvariantCulture))
               .Append(",\"zone_px\":").Append(J(_leg.Z.Px))
-              .Append(",\"zone_touches\":").Append(_leg.Z.Touches)
+              .Append(",\"zone_touches\":").Append(_leg.Z.Touches.ToString(CultureInfo.InvariantCulture))
               .Append(",\"leg_arm_ts\":").Append(_leg.T0.Ticks.ToString(CultureInfo.InvariantCulture))
               .Append(",\"trig_ts\":").Append(trig ? Time[0].Ticks.ToString(CultureInfo.InvariantCulture) : "-1")
               .Append(",\"trig_kind\":").Append(trig ? "\"" + trigKind + "\"" : "null")
-              .Append(",\"attempt\":").Append(Math.Min(_leg.Fills + 1, MaxAttemptsPerLeg))
+              .Append(",\"attempt\":").Append(Math.Min(_leg.Fills + 1, MaxAttemptsPerLeg).ToString(CultureInfo.InvariantCulture))
               .Append(",\"entry_stop_px\":").Append(J(entryStop))
               .Append(",\"entry_tick\":-1")
               .Append(",\"pull_ext_px\":").Append(J(_leg.Pull))
@@ -699,7 +721,7 @@ namespace NinjaTrader.NinjaScript.Strategies
               .Append(",\"atr15\":").Append(J(a15))
               .Append(",\"date\":\"").Append(Time[0].ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)).Append("\"")
               .Append(",\"source\":\"nt8\"")
-              .Append(",\"epoch\":").Append(_epoch)
+              .Append(",\"epoch\":").Append(_epoch.ToString(CultureInfo.InvariantCulture))
               .Append(",\"instrument\":\"").Append(Instrument.MasterInstrument.Name).Append("\"}");
             CorpusAppend(sb.ToString());
         }
