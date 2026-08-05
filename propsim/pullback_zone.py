@@ -5,7 +5,6 @@ Spec: docs/specs/2026-08-05-pullbackzone-design.md. Parameter list is CLOSED
 and mirrors ninjascript/PullbackZoneStrategy.cs one-to-one.
 Sandbox rule: imports limited to math/numpy so plugins.py --check passes.
 """
-import math
 import numpy as np
 
 TICK = 0.25
@@ -109,7 +108,9 @@ def zones(b15, day15, p):
     #zone_min_touches confirmed; the pivot itself was already confirmed
     zone_pivot_k bars earlier).
     died_i: first 15m bar whose close crosses the far edge by more than
-    zone_break_atr15 * ATR15, or born_i + zone_expiry; 10**9 while alive.
+    zone_break_atr15 * ATR15, or the first bar of the zone_expiry-th session
+    after birth (day15[i] >= day15[born_i] + zone_expiry -- sessions, not
+    bars: the design spec's default is "2 sessions"); 10**9 while alive.
     A new pivot within one band-width of a live zone merges into it (the old
     zone keeps its identity and touch count).
 
@@ -172,7 +173,7 @@ def zones(b15, day15, p):
             lo_edge, hi_edge = z["px"] - z["half_w"], z["px"] + z["half_w"]
             broke = ((c[i] > hi_edge + break_atr * a) if z["pivot_high"]
                       else (c[i] < lo_edge - break_atr * a))
-            if broke or (i - z["born_i"] >= expiry):
+            if broke or (day15[i] >= day15[z["born_i"]] + expiry):
                 z["died_i"] = i
 
     return out
@@ -228,6 +229,16 @@ def _selfcheck_zones():
     assert z[0]["born_i"] == 32, z[0]
     assert z[0]["died_i"] == 40, z[0]
     assert z[0]["touches"] == 2, z[0]
+
+    # zone_expiry counts SESSIONS via day15, not bars (spec default "2
+    # sessions"): born on day 0 (bar 32), 3 sessions total, nothing else
+    # kills it -- must die at the first bar of day 0 + 2 = day 2, well
+    # before the (now moot) clean-break bar at 40 is even reached.
+    day3 = np.concatenate([np.zeros(33, int), np.ones(6, int), np.full(6, 2, int)])
+    p3 = dict(p, zone_expiry=2)
+    z3 = zones(dict(h=h, l=l, c=c), day3, p3)
+    assert z3[0]["born_i"] == 32, z3[0]
+    assert z3[0]["died_i"] == 39, z3[0]                 # first bar of day 2
     print("zones OK")
 
 
