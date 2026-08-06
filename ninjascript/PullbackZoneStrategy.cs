@@ -909,6 +909,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void FlattenNow()
         {
+            // PREMISE: SINGLE INSTRUMENT. `Position` here (and every other
+            // handler-side Position read, including the orphan-fill flatten net)
+            // is correct only because both series are the same instrument. Add a
+            // second INSTRUMENT series and this silently no-ops — no compile
+            // error — and the unbracketed-position Critical comes straight back.
+            //
             // Explicit barsInProgressIndex: this is reached from
             // OnExecutionUpdate too, where BarsInProgress is non-deterministic.
             // The trailing "" is fromEntrySignal, not a signal name (the
