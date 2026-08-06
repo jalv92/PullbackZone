@@ -187,11 +187,16 @@ def _delta12_hit(ps_row, pairs1, exit_by_trig):
     return False
 
 
-# Re-arm at ext_i+2 (Amendment 2) + entry_ttl_bars=6 (PARAMS_DEFAULT, frozen)
-# = 8 bars of wall clock. Delta 11's extra fill must land INSIDE the TTL
-# window PropSim had blocked, not merely "sometime after" a hunt_reset — an
-# unbounded match would let a genuine bug hide behind this bucket forever.
-_DELTA11_BOUND_S = (2 + 6) * 30
+# entry_ttl_bars=6 (PARAMS_DEFAULT, frozen) * 30s = 180s: PropSim's OWN busy
+# window (pullback_zone.py:544, `t_ttl = t_trig + ttl*30*_TPS`) is anchored at
+# the cancelled entry's ORIGINAL trig_ts and ends there, full stop — PropSim
+# never even sees the early cancel (that's delta 11's whole premise), so
+# NT8's re-arm delay does not move the window's endpoint. No delta-8 slack
+# added: both timestamps here are NT8-side, same clock, nothing to offset.
+# Delta 11's extra fill must land INSIDE that window, not merely "sometime
+# after" a hunt_reset — an unbounded match would let a genuine bug hide
+# behind this bucket forever.
+_DELTA11_BOUND_S = 6 * 30
 
 
 def _delta11_hunt_reset(nt_row, nt_ep_all):
@@ -504,25 +509,25 @@ def _selftest():
     assert rc == 2, rc
     print("selftest (d) out-of-RTH -> sanity gate rejection, exit 2 OK")
 
-    # (e) delta-11 bound: an unmatched NT8 fill within the 240s re-arm+TTL
-    # window of a preceding hunt_reset -> DELTA11_HUNT_RESET_EXTRA; the same
-    # shape an hour later -> UNEXPLAINED (the bound must actually gate it).
-    # Two separate zone buckets so each fill's "nearest preceding row" is
-    # unambiguously its own hunt_reset, not the other case's fill.
+    # (e) delta-11 bound at the actual boundary (180s = entry_ttl_bars*30,
+    # PropSim's own busy-window length; <= is inclusive): +179s -> inside,
+    # DELTA11_HUNT_RESET_EXTRA; +181s -> outside, UNEXPLAINED. Two separate
+    # zone buckets so each fill's "nearest preceding row" is unambiguously
+    # its own hunt_reset, not the other case's fill.
     d5 = "2026-08-04"
-    nt_reset_near = _mk_row("nt8", "expired", d5, 1, 21300.0, (9, 31, 0), reason="hunt_reset")
-    nt_near = _mk_row("nt8", "filled", d5, 1, 21300.0, (9, 33, 0))          # +120s: inside 240s
-    nt_reset_far = _mk_row("nt8", "expired", d5, 1, 21400.0, (9, 31, 0), reason="hunt_reset")
-    nt_far = _mk_row("nt8", "filled", d5, 1, 21400.0, (10, 31, 0))          # +3600s: outside 240s
+    nt_reset_in = _mk_row("nt8", "expired", d5, 1, 21300.0, (9, 31, 0), reason="hunt_reset")
+    nt_in = _mk_row("nt8", "filled", d5, 1, 21300.0, (9, 33, 59))           # +179s: inside 180s
+    nt_reset_out = _mk_row("nt8", "expired", d5, 1, 21400.0, (9, 31, 0), reason="hunt_reset")
+    nt_out = _mk_row("nt8", "filled", d5, 1, 21400.0, (9, 34, 1))          # +181s: outside 180s
     # A same-bucket propsim row far off in time keeps the bucket "present" on
     # the propsim side, so delta7 (whole leg absent) doesn't preempt the bound check.
-    ps_dummy_near = _mk_row("propsim", "expired", d5, 1, 21300.0, (14, 0, 0))
-    ps_dummy_far = _mk_row("propsim", "expired", d5, 1, 21400.0, (14, 0, 0))
-    buckets_e = run_gate([nt_reset_near, nt_near, nt_reset_far, nt_far],
-                          [ps_dummy_near, ps_dummy_far])
-    assert any(it["row"] is nt_near for it in buckets_e.get("DELTA11_HUNT_RESET_EXTRA", []))
-    assert any(it["row"] is nt_far for it in buckets_e.get("UNEXPLAINED", []))
-    print("selftest (e) delta-11 hunt-reset bound (240s) enforced OK")
+    ps_dummy_in = _mk_row("propsim", "expired", d5, 1, 21300.0, (14, 0, 0))
+    ps_dummy_out = _mk_row("propsim", "expired", d5, 1, 21400.0, (14, 0, 0))
+    buckets_e = run_gate([nt_reset_in, nt_in, nt_reset_out, nt_out],
+                          [ps_dummy_in, ps_dummy_out])
+    assert any(it["row"] is nt_in for it in buckets_e.get("DELTA11_HUNT_RESET_EXTRA", []))
+    assert any(it["row"] is nt_out for it in buckets_e.get("UNEXPLAINED", []))
+    print("selftest (e) delta-11 hunt-reset bound (180s, inclusive) at +179s/+181s OK")
 
     # (f) delta-13 precondition: exit(reason=target) landing 3 ticks SHORT of
     # target_px (an undershoot, not "beyond target on a gap") must stay
