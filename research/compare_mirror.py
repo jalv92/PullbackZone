@@ -172,7 +172,12 @@ def _delta12_hit(ps_row, pairs1, exit_by_trig):
     """PropSim's attempt-2 episode with no NT8 counterpart, where attempt 1's
     NT8 fill was closed by hand or the session flatten. Spec 7 grants attempt
     2 only after a real stop-out; PropSim's tape-only _resolve_exit cannot see
-    a manual close, so it grants one PropSim never should have (delta 12)."""
+    a manual close, so it grants one PropSim never should have (delta 12).
+
+    Same schema limit as DELTA7/DELTA11: bucket-key matching carries no real
+    leg identity, only (date, dir, zone). Not fixable in the joiner alone —
+    would need a leg id in both corpora (tracked in the plan's delta ledger,
+    not this file's job to invent)."""
     key = _bucket_key(ps_row)
     for ps1, nt1, _ in pairs1:
         if ps1.get("attempt") == 1 and nt1["kind"] == "filled" and _bucket_key(ps1) == key:
@@ -182,10 +187,18 @@ def _delta12_hit(ps_row, pairs1, exit_by_trig):
     return False
 
 
+# Re-arm at ext_i+2 (Amendment 2) + entry_ttl_bars=6 (PARAMS_DEFAULT, frozen)
+# = 8 bars of wall clock. Delta 11's extra fill must land INSIDE the TTL
+# window PropSim had blocked, not merely "sometime after" a hunt_reset — an
+# unbounded match would let a genuine bug hide behind this bucket forever.
+_DELTA11_BOUND_S = (2 + 6) * 30
+
+
 def _delta11_hunt_reset(nt_row, nt_ep_all):
     """NT8-EXTRA fill inside a window PropSim had marked busy: the nearest
     earlier row in this leg's bucket is an entry cancelled for a hunt reset,
-    not a TTL or leg death (delta 11, non-conservative half)."""
+    not a TTL or leg death (delta 11, non-conservative half), AND the fill
+    lands within the re-arm+TTL window that reset could plausibly open."""
     key = _bucket_key(nt_row)
     cands = [r for r in nt_ep_all
              if _bucket_key(r) == key and r.get("trig_ts", -1) >= 0
@@ -193,7 +206,9 @@ def _delta11_hunt_reset(nt_row, nt_ep_all):
     if not cands:
         return False
     prev = max(cands, key=lambda r: r["trig_ts"])
-    return prev["kind"] == "expired" and prev.get("reason") == "hunt_reset"
+    if prev["kind"] != "expired" or prev.get("reason") != "hunt_reset":
+        return False
+    return (nt_row["trig_ts"] - prev["trig_ts"]) <= _DELTA11_BOUND_S * _TPS
 
 
 def check_exits(nt_exit_rows, pairs1):
@@ -209,13 +224,17 @@ def check_exits(nt_exit_rows, pairs1):
             out.append((ex, "NO_IMPLIED_EXIT", None))     # flatten/manual: no PropSim price to check
             continue
         implied = ps["stop_px"] if reason == "stop" else ps["target_px"]
-        dt = _tick_delta(ex.get("exit_px", implied), implied)
+        dt = _tick_delta(ex["exit_px"], implied)          # the .cs always writes this; a
+                                                            # missing field is malformed data,
+                                                            # not a case to paper over
         if dt <= 1.0 + 1e-6:
             out.append((ex, "MATCHED_EXIT", dt))
-        elif reason == "target":
+        elif reason == "target" and ex["dir"] * (ex["exit_px"] - implied) > 0:
             # delta 13: a stop-market entry filling through its price on a gap
             # can round-trip the frozen target instantly — fill-slippage, not
-            # a pattern failure.
+            # a pattern failure. Mechanism-bound: the fill must actually land
+            # BEYOND target in the trade's own direction, or this is a real
+            # mismatch (a target undershoot has no delta-13 explanation).
             out.append((ex, "DELTA13_GAP_SLIPPAGE", dt))
         else:
             out.append((ex, "UNEXPLAINED_EXIT", dt))
@@ -418,7 +437,7 @@ def _mk_ts(date_str, hh, mm, ss=0):
     return (days * 86400 + hh * 3600 + mm * 60 + ss) * _TPS
 
 
-def _mk_row(source, kind, date_str, dir_, zone_px, trig_hhmm, reason=None, attempt=1):
+def _mk_row(source, kind, date_str, dir_, zone_px, trig_hhmm, reason=None, attempt=1, exit_px=None):
     trig_ts = _mk_ts(date_str, *trig_hhmm)
     row = dict(kind=kind, dir=dir_, zone_px=zone_px, zone_touches=2,
                leg_arm_ts=trig_ts - 5 * 30 * _TPS, trig_ts=trig_ts, trig_kind="engulfing",
@@ -430,6 +449,8 @@ def _mk_row(source, kind, date_str, dir_, zone_px, trig_hhmm, reason=None, attem
         row["instrument"] = "NQ"
     if reason is not None:
         row["reason"] = reason
+    if exit_px is not None:
+        row["exit_px"] = exit_px
     return row
 
 
@@ -482,6 +503,38 @@ def _selftest():
         rc = main(["--nt8", str(nt_p), "--propsim", str(ps_p)])
     assert rc == 2, rc
     print("selftest (d) out-of-RTH -> sanity gate rejection, exit 2 OK")
+
+    # (e) delta-11 bound: an unmatched NT8 fill within the 240s re-arm+TTL
+    # window of a preceding hunt_reset -> DELTA11_HUNT_RESET_EXTRA; the same
+    # shape an hour later -> UNEXPLAINED (the bound must actually gate it).
+    # Two separate zone buckets so each fill's "nearest preceding row" is
+    # unambiguously its own hunt_reset, not the other case's fill.
+    d5 = "2026-08-04"
+    nt_reset_near = _mk_row("nt8", "expired", d5, 1, 21300.0, (9, 31, 0), reason="hunt_reset")
+    nt_near = _mk_row("nt8", "filled", d5, 1, 21300.0, (9, 33, 0))          # +120s: inside 240s
+    nt_reset_far = _mk_row("nt8", "expired", d5, 1, 21400.0, (9, 31, 0), reason="hunt_reset")
+    nt_far = _mk_row("nt8", "filled", d5, 1, 21400.0, (10, 31, 0))          # +3600s: outside 240s
+    # A same-bucket propsim row far off in time keeps the bucket "present" on
+    # the propsim side, so delta7 (whole leg absent) doesn't preempt the bound check.
+    ps_dummy_near = _mk_row("propsim", "expired", d5, 1, 21300.0, (14, 0, 0))
+    ps_dummy_far = _mk_row("propsim", "expired", d5, 1, 21400.0, (14, 0, 0))
+    buckets_e = run_gate([nt_reset_near, nt_near, nt_reset_far, nt_far],
+                          [ps_dummy_near, ps_dummy_far])
+    assert any(it["row"] is nt_near for it in buckets_e.get("DELTA11_HUNT_RESET_EXTRA", []))
+    assert any(it["row"] is nt_far for it in buckets_e.get("UNEXPLAINED", []))
+    print("selftest (e) delta-11 hunt-reset bound (240s) enforced OK")
+
+    # (f) delta-13 precondition: exit(reason=target) landing 3 ticks SHORT of
+    # target_px (an undershoot, not "beyond target on a gap") must stay
+    # UNEXPLAINED_EXIT, never DELTA13_GAP_SLIPPAGE.
+    ps_f = _mk_row("propsim", "filled", d5, 1, 21500.0, (12, 0, 0))
+    nt_f = _mk_row("nt8", "filled", d5, 1, 21500.0, (12, 0, 10))
+    ex_f = _mk_row("nt8", "exit", d5, 1, 21500.0, (12, 0, 10),
+                    reason="target", exit_px=nt_f["target_px"] - 3 * TICK)
+    ex_row, label_f, dt_f = check_exits([ex_f], [(ps_f, nt_f, 0.0)])[0]
+    assert label_f == "UNEXPLAINED_EXIT", label_f
+    assert dt_f == 3.0, dt_f
+    print("selftest (f) delta-13 target undershoot -> UNEXPLAINED_EXIT, not gap-slippage OK")
 
     print("compare_mirror selftest: ALL OK")
 
