@@ -199,3 +199,7 @@ starvation from a mis-specified upstream metric, corrected on structural grounds
 and re-passed at 1.00× — full account in the spec's audit trail. `stop_buffer_atr30`
 has since been re-frozen once per amendment (1.30 → 1.25 → **1.30**), each pass
 pre-registered and each re-passing the gate.
+
+## Open TODO
+
+- [ ] Capture `docs/assets/hero.png` (+2 screenshots) from the FIRST real V1 Playback session — README ships 0/3 images under readme-craft's disclosed escape hatch until then.
