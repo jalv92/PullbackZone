@@ -50,10 +50,12 @@ fidelity signal. All three must hold for the session set to count:
   **PASS** = `MATCHED` ≥ 95% of PropSim `filled` episodes after excluding
   episodes explained by an accepted delta from the denominator, entry/stop/target
   all within 1 tick, **and** zero rows in any `UNEXPLAINED*` bucket regardless of
-  the rate. Known accepted divergences (deltas 5, 7, 11–14 in the plan) get their
+  the rate. Known accepted divergences (deltas 5, 11–14 in the plan) get their
   own buckets and do not count against the 95%; `compare_mirror.py` prints both
   the raw and the delta-adjusted rate so a regression in the raw number stays
-  visible even when the adjusted one still passes.
+  visible even when the adjusted one still passes. Delta 7 keeps its own bucket
+  for diagnosis but counts against the rate — a never-armed leg is a setup
+  failure, not an accepted divergence.
 - First things to check if it disagrees: ATR seeding (both sides' Wilder
   recursion must start at bar 0, no NaN warmup, reaching across session breaks),
   first-session warm-up, 15m bar alignment, tie-breaking when two triggers fire

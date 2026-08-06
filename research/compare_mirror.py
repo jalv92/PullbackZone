@@ -320,12 +320,15 @@ def run_gate(nt8_rows_raw, ps_rows):
 
 # Buckets where a PropSim `filled` episode is legitimately explained without a
 # clean NT8 match (docs/validation.md: "Known accepted divergences ... do not
-# count against the 95%"). DELTA11_HUNT_RESET_EXTRA and DELTA13/14 are excluded
-# on purpose: those are NT8-side extras or exit-side/terminal rows, never a
-# PropSim `filled` row that needs excusing from the denominator.
+# count against the 95%"). DELTA7 is deliberately excluded: unlike 5/11/12
+# (positive corroboration -- a matched pair plus reason evidence from the NT8
+# side), DELTA7 is pure absence, and it's the designated symptom of a template/
+# alignment/chunking setup error -- it keeps its own bucket for diagnosis but
+# still counts against the rate. DELTA11_HUNT_RESET_EXTRA and DELTA13/14 are
+# also excluded: NT8-side extras or exit-side/terminal rows, never a PropSim
+# `filled` row that needs excusing from the denominator.
 ACCEPTED_DELTA_FILL_LABELS = (
-    "DELTA5_TTL_JITTER", "DELTA7_NEVER_ARMED_NT8",
-    "DELTA11_EARLY_CANCEL", "DELTA12_MANUAL_NO_ATTEMPT2",
+    "DELTA5_TTL_JITTER", "DELTA11_EARLY_CANCEL", "DELTA12_MANUAL_NO_ATTEMPT2",
 )
 
 
@@ -605,6 +608,25 @@ def _selftest():
     assert len(unexp_h) == 1, unexp_h
     assert not passed_h, (passed_h, raw_h, adj_h)
     print("selftest (g) inverse guard: 1 UNEXPLAINED among 20 matched -> still FAIL OK")
+
+    # (h) delta 7 counts AGAINST the rate (reviewer-adjudicated false-PASS
+    # probe, collapsed): 5 exact matches + 1 ps-fill whose bucket never
+    # appears on the NT8 side at all (DELTA7_NEVER_ARMED_NT8 -- pure absence,
+    # unlike 5/11/12's positive NT8-side corroboration) -> adjusted 5/6 =
+    # 83.3%, still FAIL.
+    d8 = "2026-08-08"
+    ps_i, nt_i = [], []
+    for i in range(5):
+        zpx = 23000.0 + i * 20
+        ps_i.append(_mk_row("propsim", "filled", d8, 1, zpx, (10, i, 0)))
+        nt_i.append(_mk_row("nt8", "filled", d8, 1, zpx, (10, i, 10)))
+    ps_i.append(_mk_row("propsim", "filled", d8, 1, 23500.0, (11, 0, 0)))  # never-armed leg
+    buckets_i = run_gate(nt_i, ps_i)
+    passed_i, raw_i, adj_i, total_i, matched_i, accepted_i, unexp_i = verdict(buckets_i, ps_i)
+    assert total_i == 6 and matched_i == 5 and accepted_i == 0, (total_i, matched_i, accepted_i)
+    assert abs(adj_i - 500.0 / 6.0) < 0.05, adj_i
+    assert not passed_i and not unexp_i, (passed_i, unexp_i)
+    print("selftest (h) delta-7 counts against the rate -> adjusted 83.3%, FAIL OK")
 
     print("compare_mirror selftest: ALL OK")
 

@@ -745,10 +745,11 @@ def _selfcheck_zones():
     assert z[0]["died_i"] == 40, z[0]
     assert z[0]["touches"] == 2, z[0]
 
-    # zone_expiry_sessions counts SESSIONS via day15, not bars (spec default
-    # "2 sessions"): born on day 0 (bar 32), 3 sessions total, nothing else
-    # kills it -- must die at the first bar of day 0 + 2 = day 2, well
-    # before the (now moot) clean-break bar at 40 is even reached.
+    # zone_expiry_sessions counts CALENDAR DAYS via day15, not bars (the dial
+    # name says sessions for closed-list continuity): born on day 0 (bar 32),
+    # 3 days total, nothing else kills it -- must die at the first bar of
+    # day 0 + 2 = day 2, well before the (now moot) clean-break bar at 40 is
+    # even reached.
     day3 = np.concatenate([np.zeros(33, int), np.ones(6, int), np.full(6, 2, int)])
     p3 = dict(p, zone_expiry_sessions=2)
     z3 = zones(dict(h=h, l=l, c=c), day3, p3)
