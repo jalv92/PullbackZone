@@ -28,14 +28,17 @@
 // is what V1 checks the exit prices against, and a `reason` field on "expired"
 // telling a TTL death from a cancel.
 //
-// MIRROR DELTA 11 (new here, plan-documented): PropSim resolves an entry's fate
-// inside the trigger bar's own iteration, so its order always works the full
-// TTL. This side has to live forward in time, and a working entry belonging to
-// a leg that has just died — or to a pullback a new leg extreme has superseded
-// — is cancelled instead of left resting. Geometry makes the second case all
-// but unreachable (a new extreme is beyond the entry stop, so the stop fills
-// first) and the first is bounded by the 3-minute TTL. `reason` on the expired
-// row is how Task 7 measures it rather than assuming.
+// MIRROR DELTA 11 (plan-documented): PropSim resolves an entry's fate inside the
+// trigger bar's own iteration, so its order always works the full TTL. This side
+// has to live forward in time, and a working entry belonging to a leg that has
+// just died — or to a pullback a new leg extreme has superseded — is cancelled
+// instead of left resting. The leg-death half is conservative: fewer NT8
+// entries. THE HUNT-RESET HALF IS NOT. A new extreme that clears the old one by
+// less than EntryOffsetTicks resets the hunt WITHOUT filling the entry (one tick
+// wide at the default offset), and NT8 can then re-arm at the new ext+2 and take
+// an entry inside the window PropSim had blocked with busy = t_ttl — an
+// NT8-EXTRA entry is this delta's signature, not a pattern bug. `reason` on
+// every expired row is how Task 7 measures it rather than assuming.
 //
 // CHART REQUIREMENTS — the mirror is void without them:
 //   * Primary series = 30 Second. Amendment 2 arms the hunt at EXACTLY
@@ -630,9 +633,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _leg.ExtBar = CurrentBar;
                 _leg.Hunt = false;
                 // The hunt window has been reset, so the pullback the working
-                // entry was priced from no longer exists (delta 11). All but
-                // unreachable: a new extreme lies BEYOND the entry stop, which
-                // therefore filled on the way — this is the belt to that brace.
+                // entry was priced from no longer exists (delta 11). Reachable
+                // in a narrow band — when the trigger candle printed AT the leg
+                // extreme, a new extreme less than EntryOffsetTicks beyond it
+                // resets the hunt without ever touching the entry stop. This is
+                // the NON-conservative half of the delta: NT8 re-arms and can
+                // enter inside a window PropSim spent on the cancelled order.
                 if (_pend != null && _pend.Owner == _leg)
                     CancelEntry("hunt_reset");
             }
@@ -739,6 +745,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             _entryOrder = dir > 0
                 ? EnterLongStopMarket(0, true, Contracts, px, SigEntry)
                 : EnterShortStopMarket(0, true, Contracts, px, SigEntry);
+            if (_entryOrder == null)
+            {
+                // NT8's internal order handling ignored the submission. Nothing
+                // is working, so releasing the gate is the whole point: left
+                // armed, `_entryPending` would silently end the run's trading.
+                _entryPending = false;
+                Corpus("expired", _pend, "not_submitted", 0);
+                _pend = null;
+                Print(Name + ": entry submission returned no order — nothing is working, gate released.");
+            }
         }
 
         // Cancelling does NOT consume the leg's attempt — only a fill does. The
@@ -757,6 +773,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         // a position and a working order outlive the leg that opened them.
         private void ManageOrders()
         {
+            // Self-healing latch. Every flatten path gates on !_flattenPending,
+            // so a flatten whose exit never reached the went-flat bookkeeping
+            // (an unattributable fill, a rewind) would silence the 15:58 backstop
+            // for the rest of the run. Flat means nothing is pending, always.
+            if (Position.MarketPosition == MarketPosition.Flat)
+                _flattenPending = false;
+
             // Session backstop. On the bar's NOMINAL close (ToTime), which is
             // where PropSim's _resolve_exit puts its flatten timestamp.
             if (!_lockout && ToTime(Time[0]) >= FlattenHhmm * 100)
@@ -880,14 +903,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void FlattenNow()
         {
-            // Two-arg overload on purpose: ExitLong(string) alone is
-            // fromEntrySignal, NOT a signal name (the BigPrints bug). An empty
-            // fromEntrySignal attaches the exit to every entry.
+            // Explicit barsInProgressIndex: this is reached from
+            // OnExecutionUpdate too, where BarsInProgress is non-deterministic.
+            // The trailing "" is fromEntrySignal, not a signal name (the
+            // BigPrints one-arg bug) — empty attaches the exit to every entry.
             _flattenPending = true;                  // BEFORE the Exit*
             if (Position.MarketPosition == MarketPosition.Long)
-                ExitLong(SigFlatten, "");
+                ExitLong(0, Position.Quantity, SigFlatten, "");
             else if (Position.MarketPosition == MarketPosition.Short)
-                ExitShort(SigFlatten, "");
+                ExitShort(0, Position.Quantity, SigFlatten, "");
             else
                 _flattenPending = false;
         }
@@ -907,18 +931,38 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (st != OrderState.Filled && st != OrderState.PartFilled
                     && !(st == OrderState.Cancelled && execution.Order.Filled > 0))
                     return;
-                _entryPending = false;               // name-gated clear
-                _entryOrder = null;
+                // A PartFilled entry is NOT over: the liveUntilCancelled
+                // remainder keeps working. Clearing the trackers here would make
+                // CancelEntry unreachable for it, so the TTL, the leg death and
+                // the flatten would all fail to cancel that remainder and it
+                // could fill minutes later, alone, against a closed position.
+                // Release them only when the ORDER is terminal.
+                if (st != OrderState.PartFilled)
+                {
+                    _entryPending = false;           // name-gated clear
+                    _entryOrder = null;
+                }
 
-                if (_open == null)                   // first execution of this entry
+                bool first = _open == null;
+                if (first)
                 {
                     _open = _pend;
                     _pend = null;
-                    if (_open == null)               // a fill with no snapshot: rewound pass
+                    if (_open == null)
+                    {
+                        // A fill with no episode behind it: a rewound pass, or a
+                        // remainder arriving after its position already closed.
+                        // It is a REAL position either way — never leave it
+                        // unbracketed, and never fall through to the went-flat
+                        // branch, which would return early and latch
+                        // _flattenPending on forever.
+                        Print(Name + ": entry execution with no episode behind it — flattening.");
+                        if (!_flattenPending)
+                            FlattenNow();
                         return;
+                    }
                     _entryFillPx = price;
                     _riskPts = Math.Abs(_open.EntryStop - _open.StopPx);
-                    Corpus("filled", _open, null, price);
                     // The attempt is consumed HERE, by the fill. `Block` holds
                     // the leg off until the exit answers whether it stopped out
                     // (PropSim decides the same thing at the same moment, from
@@ -936,9 +980,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // exposure (the LatigoBreak lockout-fill lesson).
                     if (!_flattenPending)
                         FlattenNow();
-                    return;
                 }
-                SubmitBrackets(execution.Order);     // prices on the first, resize on later ones
+                else
+                    SubmitBrackets(execution.Order); // prices on the first, resize on later ones
+                // LAST, after the protection is out: the corpus does synchronous
+                // file I/O under a static lock, and nothing that slow belongs
+                // between a live fill and its stop.
+                if (first)
+                    Corpus("filled", _open, null, price);
                 return;
             }
 
@@ -952,13 +1001,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                           : n == SigTarget ? "target"
                           : (n == SigFlatten || n == "Exit on session close") ? "flatten"
                           : "manual";
+            Row done = _open;                        // the row outlives the state below
             _flattenPending = false;
-            Corpus("exit", _open, reason, price);
+            // Only reachable after a PARTIAL entry fill: the position this order
+            // opened is closed, so its remainder has nothing left to open. Kill
+            // it here rather than let it fill naked and be flattened a moment
+            // later — PropSim's fills are atomic and it would never enter twice.
+            CancelEntry("position_closed");
             // ponytail: one entry price, one exit price. At Contracts > 1 with
             // partial fills this is the first fill against the last exit rather
             // than a weighted average — a guard's arithmetic, not the ledger's.
             if (_riskPts > 0)
-                _dayR += _open.Dir * (price - _entryFillPx) / _riskPts;
+                _dayR += done.Dir * (price - _entryFillPx) / _riskPts;
 
             // SPEC 7: attempt 2 exists only after attempt 1 STOPS OUT. On any
             // other exit this leg is done entering, forever. PropSim derives the
@@ -972,7 +1026,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             // CurrentBars[0], never CurrentBar: outside OnBarUpdate the bare
             // property resolves against whichever series ran last, and the 15m
             // one would hand back a wholly different (much smaller) index.
-            if (_leg != null && _open.Owner == _leg)
+            if (_leg != null && done.Owner == _leg)
                 _leg.Block = reason == "stop" ? CurrentBars[0] : int.MaxValue;
 
             _open = null;
@@ -988,6 +1042,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             // the V1 gate runs with it off.
             if (DailyLossR > 0 && _dayR <= -DailyLossR)
                 Lockout("daily loss " + J(_dayR) + "R");
+
+            // LAST here too: that Lockout can be cancelling a partial entry's
+            // working remainder, and the corpus write must not sit in front of a
+            // live cancel. Same rule as the fill path.
+            Corpus("exit", done, reason, price);
         }
 
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
