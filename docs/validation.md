@@ -23,25 +23,37 @@ be believed; see the honest prior in the section after the table.
 
 ## V1 — mirror fidelity protocol
 
-**Nothing downstream is meaningful until this passes.** Run ≥5 Market Replay RTH
-sessions on the NT8 side; dump the same dates from the PropSim side; join with the
-gate. All three must hold for the session set to count:
+**Nothing downstream is meaningful until this passes.** The run shape is
+**continuous, not chunked**: ONE Market Replay Playback covering the whole
+≥5-session window — the chart's days-to-load set to exactly that date range, no
+restarting mid-window — dumped from the PropSim side with ONE
+`dump_episodes.py --start D1 --end D5` call over the identical range, joined
+with ONE `compare_mirror.py` invocation. Why: NT8's Wilder ATR recursions and
+the 15m zones carry state forward from every bar the Playback run has loaded,
+across session breaks; PropSim's dump starts cold at `--start`. Chunking either
+side desyncs that state from PropSim's cold start, and any date present on only
+one side shows up as a spurious `DELTA7_NEVER_ARMED_*` row instead of a real
+fidelity signal. All three must hold for the session set to count:
 
 - `Contracts = 1`, `BreakevenAtR = 0`, `DailyLossR = 0` — PropSim cannot mirror a
   non-zero daily guard (accepted delta 1) and the exit model omits the breakeven
   stop (accepted delta 3); both must be off for the gate to mean anything.
 - NT8 chart on the RTH session template so the 15m series lands on the same
   09:30 grid PropSim's `slice_range(rth_only=True)` produces; both series (30s
-  primary, 15m secondary) must share the same history depth — a longer 15m
-  history gives NT8's zones/ATR15 a warm-up PropSim never had.
+  primary, 15m secondary) must load the same range, matched to the PropSim
+  dump slice — a longer 15m history gives NT8's zones/ATR15 a warm-up PropSim
+  never had.
 - NT8 corpus: `%USERPROFILE%\Documents\PullbackZone\pz_corpus.jsonl` (grows through
   the Replay sessions, one JSONL line per state change).
-- PropSim corpus: `research/dump_episodes.py --contract "NQ 09-26" --start D --end D --out FILE.jsonl` — **always pass an explicit contract.** `--contract ALL` spans contract rolls and is not the tape slice a single Replay session compares against; `compare_mirror.py` only warns on `ALL`, it does not refuse it.
+- PropSim corpus: `research/dump_episodes.py --contract "NQ 09-26" --start D1 --end D5 --out FILE.jsonl` — ONE call spanning the whole ≥5-session window (see above), never one dump per day. **Always pass an explicit contract.** `--contract ALL` spans contract rolls and is not the tape slice a single Replay session compares against; `compare_mirror.py` only warns on `ALL`, it does not refuse it.
 - Gate: `research/compare_mirror.py --nt8 pz_corpus.jsonl --propsim FILE.jsonl`.
-  **PASS** = `MATCHED` ≥ 95% of PropSim `filled` episodes, entry/stop/target all
-  within 1 tick, **and** zero rows in any `UNEXPLAINED*` bucket. Known accepted
-  divergences (deltas 5, 11–14 in the plan) get their own buckets and do not
-  count against the 95%; only genuine mismatches do.
+  **PASS** = `MATCHED` ≥ 95% of PropSim `filled` episodes after excluding
+  episodes explained by an accepted delta from the denominator, entry/stop/target
+  all within 1 tick, **and** zero rows in any `UNEXPLAINED*` bucket regardless of
+  the rate. Known accepted divergences (deltas 5, 7, 11–14 in the plan) get their
+  own buckets and do not count against the 95%; `compare_mirror.py` prints both
+  the raw and the delta-adjusted rate so a regression in the raw number stays
+  visible even when the adjusted one still passes.
 - First things to check if it disagrees: ATR seeding (both sides' Wilder
   recursion must start at bar 0, no NaN warmup, reaching across session breaks),
   first-session warm-up, 15m bar alignment, tie-breaking when two triggers fire
@@ -72,7 +84,9 @@ gate. All three must hold for the session set to count:
    unrounded, as PropSim computes them.
 10. Rewinding Playback (stepping back and replaying forward again) does not
     double-write or resurrect stale rows — the epoch fence must drop in-flight
-    notes from a discarded pass.
+    notes from a discarded pass. Rewind only to before the session open, or
+    discard the session — a mid-session rewind leaves a mixed-epoch corpus the
+    joiner cannot fully reconcile.
 
 ## V2 — first honest look (locked)
 

@@ -129,7 +129,7 @@ sandbox allowlist") — an older PropSim checkout rejects this plugin at
 |---|---|---|
 | Timezone | ET (America/New_York) | Every session boundary (09:30 open, 15:58 flatten) is stated in ET |
 | Session template (NT8) | RTH | Must match PropSim's `rth_only=True` tape slice exactly, or the 15m grid drifts |
-| Series history depth | 15m series ≤ 30s series | A longer 15m history gives NT8's zones/ATR a warm-up PropSim never had |
+| Series history depth | Both series load the same range, matched to the PropSim dump slice | A longer 15m history gives NT8's zones/ATR a warm-up PropSim never had |
 | `Contracts` | 1, for any V1 gate session | The gate compares trade-for-trade; sizing is a separate decision |
 | `BreakevenAtR` | 0 (off) | PropSim's exit model omits the breakeven stop — a non-zero value breaks the mirror (accepted delta) |
 | `DailyLossR` | 0 (off) | PropSim's episode generation is precomputed and can't see prior closures — a non-zero value breaks the mirror (accepted delta) |

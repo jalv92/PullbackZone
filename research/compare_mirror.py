@@ -318,14 +318,36 @@ def run_gate(nt8_rows_raw, ps_rows):
     return buckets
 
 
+# Buckets where a PropSim `filled` episode is legitimately explained without a
+# clean NT8 match (docs/validation.md: "Known accepted divergences ... do not
+# count against the 95%"). DELTA11_HUNT_RESET_EXTRA and DELTA13/14 are excluded
+# on purpose: those are NT8-side extras or exit-side/terminal rows, never a
+# PropSim `filled` row that needs excusing from the denominator.
+ACCEPTED_DELTA_FILL_LABELS = (
+    "DELTA5_TTL_JITTER", "DELTA7_NEVER_ARMED_NT8",
+    "DELTA11_EARLY_CANCEL", "DELTA12_MANUAL_NO_ATTEMPT2",
+)
+
+
 def verdict(buckets, ps_rows):
+    """PASS is MATCHED / (PropSim fills minus the ones excused by an accepted
+    delta), not MATCHED / all PropSim fills -- the raw rate mechanically fails
+    the moment a single accepted delta shows up in a small session set."""
     total_filled = sum(1 for r in ps_rows if r["kind"] == "filled")
     matched = len(buckets.get("MATCHED", []))
-    rate = (matched / total_filled * 100.0) if total_filled else 0.0
+    accepted = sum(
+        1
+        for label in ACCEPTED_DELTA_FILL_LABELS
+        for item in buckets.get(label, [])
+        if (item.get("ps") or item.get("row") or {}).get("kind") == "filled"
+    )
+    denom = total_filled - accepted
+    raw_rate = (matched / total_filled * 100.0) if total_filled else 0.0
+    adj_rate = (matched / denom * 100.0) if denom else 0.0
     unexplained = (buckets.get("UNEXPLAINED", []) + buckets.get("UNEXPLAINED_PRICE", [])
                    + buckets.get("UNEXPLAINED_EXIT", []))
-    passed = total_filled > 0 and rate >= 95.0 and not unexplained
-    return passed, rate, total_filled, matched, unexplained
+    passed = total_filled > 0 and denom > 0 and adj_rate >= 95.0 and not unexplained
+    return passed, raw_rate, adj_rate, total_filled, matched, accepted, unexplained
 
 
 def _row_date(item):
@@ -424,8 +446,10 @@ def main(argv=None):
         return 2
 
     print_report(buckets, ps_rows, dedup_nt8(nt8_raw))
-    passed, rate, total, matched, unexplained = verdict(buckets, ps_rows)
-    print(f"filled episodes matched: {matched}/{total} ({rate:.1f}%), unexplained rows: {len(unexplained)}")
+    passed, raw_rate, adj_rate, total, matched, accepted, unexplained = verdict(buckets, ps_rows)
+    print(f"filled episodes matched: {matched}/{total} raw={raw_rate:.1f}%, "
+          f"adjusted={adj_rate:.1f}% (excludes {accepted} accepted-delta fill(s), "
+          f"denom {total - accepted}), unexplained rows: {len(unexplained)}")
     if passed:
         print("PASS")
         return 0
@@ -540,6 +564,47 @@ def _selftest():
     assert label_f == "UNEXPLAINED_EXIT", label_f
     assert dt_f == 3.0, dt_f
     print("selftest (f) delta-13 target undershoot -> UNEXPLAINED_EXIT, not gap-slippage OK")
+
+    # (g) verdict() denominator: an accepted delta must not count against the
+    # 95% (docs/validation.md). 5 exact matches + 1 legitimate early-cancel
+    # (PropSim filled, NT8 expired/leg_died) -> raw 5/6=83.3%, adjusted 5/5=100%,
+    # PASS despite the raw rate sitting well under the 95% bar.
+    d6 = "2026-08-06"
+    ps_g, nt_g = [], []
+    for i in range(5):
+        zpx = 21000.0 + i * 20
+        ps_g.append(_mk_row("propsim", "filled", d6, 1, zpx, (9, 40 + i, 0)))
+        nt_g.append(_mk_row("nt8", "filled", d6, 1, zpx, (9, 40 + i, 10)))
+    zpx_cancel = 21200.0
+    ps_g.append(_mk_row("propsim", "filled", d6, 1, zpx_cancel, (10, 0, 0)))
+    nt_g.append(_mk_row("nt8", "expired", d6, 1, zpx_cancel, (10, 0, 15), reason="leg_died"))
+    buckets_g = run_gate(nt_g, ps_g)
+    passed_g, raw_g, adj_g, total_g, matched_g, accepted_g, unexp_g = verdict(buckets_g, ps_g)
+    assert total_g == 6 and matched_g == 5 and accepted_g == 1, (total_g, matched_g, accepted_g)
+    assert abs(raw_g - 500.0 / 6.0) < 0.05, raw_g
+    assert adj_g == 100.0, adj_g
+    assert passed_g and not unexp_g, (passed_g, unexp_g)
+    print("selftest (g) 1/6 accepted-delta fill -> raw 83.3%, adjusted 100%, PASS OK")
+
+    # (g) inverse guard: a genuine mismatch (PropSim expired, NT8 filled --
+    # "PropSim never saw the print reach entry, but NT8 filled") still fails
+    # the gate even with 20/20 matched fills and a 100% raw/adjusted rate --
+    # the zero-UNEXPLAINED hard rule is never waived by the rate.
+    d7 = "2026-08-07"
+    ps_h, nt_h = [], []
+    for i in range(20):
+        zpx = 22000.0 + i * 20
+        ps_h.append(_mk_row("propsim", "filled", d7, 1, zpx, (10, i, 0)))
+        nt_h.append(_mk_row("nt8", "filled", d7, 1, zpx, (10, i, 10)))
+    zpx_mismatch = 22500.0
+    ps_h.append(_mk_row("propsim", "expired", d7, 1, zpx_mismatch, (11, 0, 0), reason="ttl"))
+    nt_h.append(_mk_row("nt8", "filled", d7, 1, zpx_mismatch, (11, 0, 10)))
+    buckets_h = run_gate(nt_h, ps_h)
+    passed_h, raw_h, adj_h, total_h, matched_h, accepted_h, unexp_h = verdict(buckets_h, ps_h)
+    assert total_h == 20 and matched_h == 20, (total_h, matched_h)
+    assert len(unexp_h) == 1, unexp_h
+    assert not passed_h, (passed_h, raw_h, adj_h)
+    print("selftest (g) inverse guard: 1 UNEXPLAINED among 20 matched -> still FAIL OK")
 
     print("compare_mirror selftest: ALL OK")
 

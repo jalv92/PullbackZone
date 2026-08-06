@@ -179,10 +179,11 @@ def zones(b15, day15, p):
     #zone_min_touches confirmed; the pivot itself was already confirmed
     zone_pivot_k bars earlier).
     died_i: first 15m bar whose close crosses the far edge by more than
-    zone_break_atr15 * ATR15, or the first bar of the zone_expiry_sessions-th
-    session after birth (day15[i] >= day15[born_i] + zone_expiry_sessions --
-    sessions, not bars: the design spec's default is "2 sessions"); 10**9
-    while alive.
+    zone_break_atr15 * ATR15, or the first bar on/after zone_expiry_sessions
+    days from birth (day15[i] >= day15[born_i] + zone_expiry_sessions).
+    zone_expiry_sessions counts CALENDAR days (a Friday-born zone with expiry
+    2 is dead Monday); the dial name says sessions for closed-list continuity.
+    10**9 while alive.
     A new pivot within one band-width of a live zone merges into it (the old
     zone keeps its identity and touch count).
 

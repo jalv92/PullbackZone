@@ -54,7 +54,10 @@ The only tick-resolution elements are the resting orders themselves.
   original side.
 - A zone is a **band**, not a line: `pivot_price ± zone_width_atr15 × ATR15`.
 - A zone dies when a 15m bar closes beyond the far edge by more than
-  `zone_break_atr15 × ATR15` (clean break), or after `zone_expiry_sessions` (age).
+  `zone_break_atr15 × ATR15` (clean break), or after `zone_expiry_sessions` (age —
+  the dial counts **calendar days**, not trading sessions: a Friday-born zone with
+  expiry 2 is dead Monday; the dial keeps the "sessions" name for closed-list
+  continuity).
 - Overlapping zones within one band-width merge (keep the older, more-touched one).
 
 ### 2. LEG
@@ -176,7 +179,7 @@ are internal constants, not parameters (dial bloat burned a search ledger before
 | Zones | `zone_pivot_k` | 3 | no |
 | | `zone_min_touches` | 2 | no |
 | | `zone_width_atr15` | **0.30** | **yes** — p60, frozen 2026-08-05 |
-| | `zone_expiry_sessions` | 2 sessions | no |
+| | `zone_expiry_sessions` | 2 calendar days | no |
 | | `zone_break_atr15` | 0.25 | no |
 | Leg | `leg_min_atr15` | **0.40** | **yes** — p40, frozen 2026-08-05 |
 | | `leg_timeout_min` | 60 | no |
