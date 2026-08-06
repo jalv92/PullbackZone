@@ -575,6 +575,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // A resting entry belongs to the leg that placed it (delta
                     // 11): the leg is gone, so is its order. Ordered before the
                     // null so `_pend.Owner` can still be compared.
+                    //
+                    // DELIBERATE EXCEPTION to "corpus after the order action":
+                    // this is the bar thread and the order is unfilled, so there
+                    // is no position waiting on protection. Swapping the two
+                    // would put the expired row BEFORE the leg_died row whenever
+                    // the cancel confirms in-stack, which reads backwards.
                     if (_pend != null && _pend.Owner == _leg)
                         CancelEntry("leg_died");
                     _leg = null;
@@ -943,8 +949,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     _entryOrder = null;
                 }
 
-                bool first = _open == null;
-                if (first)
+                // Captured before any order action below, which can re-enter
+                // this handler in-stack (a marketable bracket, the lockout
+                // flatten) and null `_open` — reading the field afterwards
+                // would drop the filled row and leave Task 7 an exit with no
+                // entry. Non-null also means "this is the first execution".
+                Row filled = null;
+                if (_open == null)
                 {
                     _open = _pend;
                     _pend = null;
@@ -961,6 +972,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                             FlattenNow();
                         return;
                     }
+                    filled = _open;
                     _entryFillPx = price;
                     _riskPts = Math.Abs(_open.EntryStop - _open.StopPx);
                     // The attempt is consumed HERE, by the fill. `Block` holds
@@ -986,8 +998,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // LAST, after the protection is out: the corpus does synchronous
                 // file I/O under a static lock, and nothing that slow belongs
                 // between a live fill and its stop.
-                if (first)
-                    Corpus("filled", _open, null, price);
+                if (filled != null)
+                    Corpus("filled", filled, null, price);
                 return;
             }
 
